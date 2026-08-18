@@ -24,7 +24,7 @@ func (l *BufferLen) IsNull() bool {
 func (l *BufferLen) GetData(h api.SQLHSTMT, idx int, ctype api.SQLSMALLINT, buf []byte) (api.SQLRETURN, error) {
 	return safeSQLCall("SQLGetData", func() api.SQLRETURN {
 		return api.SQLGetData(h, api.SQLUSMALLINT(idx+1), ctype,
-			api.SQLPOINTER(unsafe.Pointer(&buf[0])), api.SQLLEN(len(buf)),
+			columnBufferPointer(buf), api.SQLLEN(len(buf)),
 			(*api.SQLLEN)(l))
 	})
 }
@@ -32,9 +32,16 @@ func (l *BufferLen) GetData(h api.SQLHSTMT, idx int, ctype api.SQLSMALLINT, buf 
 func (l *BufferLen) Bind(h api.SQLHSTMT, idx int, ctype api.SQLSMALLINT, buf []byte) (api.SQLRETURN, error) {
 	return safeSQLCall("SQLBindCol", func() api.SQLRETURN {
 		return api.SQLBindCol(h, api.SQLUSMALLINT(idx+1), ctype,
-			api.SQLPOINTER(unsafe.Pointer(&buf[0])), api.SQLLEN(len(buf)),
+			columnBufferPointer(buf), api.SQLLEN(len(buf)),
 			(*api.SQLLEN)(l))
 	})
+}
+
+func columnBufferPointer(buffer []byte) api.SQLPOINTER {
+	if len(buffer) == 0 {
+		return nil
+	}
+	return api.SQLPOINTER(unsafe.Pointer(&buffer[0]))
 }
 
 // Column provides access to row columns.
@@ -55,28 +62,48 @@ func describeColumn(h api.SQLHSTMT, idx int, namebuf []uint16) (namelen int, sql
 	return int(l), sqltype, size, ret, err
 }
 
+type columnDescriber func(api.SQLHSTMT, int, []uint16) (int, api.SQLSMALLINT, api.SQLULEN, api.SQLRETURN, error)
+
+const (
+	initialColumnNameBufferLength = 150
+	maxColumnNameLength           = 32766
+)
+
 // TODO(brainman): did not check for MS SQL timestamp
 
 func NewColumn(h api.SQLHSTMT, idx int) (Column, error) {
-	namebuf := make([]uint16, 150)
-	namelen, sqltype, size, ret, callErr := describeColumn(h, idx, namebuf)
+	return newColumn(h, idx, describeColumn)
+}
+
+func newColumn(h api.SQLHSTMT, idx int, describe columnDescriber) (Column, error) {
+	namebuf := make([]uint16, initialColumnNameBufferLength)
+	namelen, sqltype, size, ret, callErr := describe(h, idx, namebuf)
 	if callErr != nil {
 		return nil, callErr
-	}
-	if ret == api.SQL_SUCCESS_WITH_INFO && namelen > len(namebuf) {
-		// try again with bigger buffer
-		namebuf = make([]uint16, namelen)
-		namelen, sqltype, size, ret, callErr = describeColumn(h, idx, namebuf)
-		if callErr != nil {
-			return nil, callErr
-		}
 	}
 	if IsError(ret) {
 		return nil, NewError("SQLDescribeCol", h)
 	}
-	if namelen > len(namebuf) {
-		// still complaining about buffer size
-		return nil, errors.New("Failed to allocate column name buffer")
+	if err := validateColumnNameLength(namelen); err != nil {
+		return nil, err
+	}
+	if namelen >= len(namebuf) {
+		// NameLengthPtr excludes the terminating NUL, so reserve one extra
+		// UTF-16 element when retrying a truncated column name.
+		namebuf = make([]uint16, namelen+1)
+		namelen, sqltype, size, ret, callErr = describe(h, idx, namebuf)
+		if callErr != nil {
+			return nil, callErr
+		}
+		if IsError(ret) {
+			return nil, NewError("SQLDescribeCol", h)
+		}
+		if err := validateColumnNameLength(namelen); err != nil {
+			return nil, err
+		}
+		if namelen >= len(namebuf) {
+			return nil, errors.New("failed to allocate column name buffer")
+		}
 	}
 	b := &BaseColumn{
 		name:    api.UTF16ToString(namebuf[:namelen]),
@@ -123,6 +150,16 @@ func NewColumn(h api.SQLHSTMT, idx int) (Column, error) {
 	}
 }
 
+func validateColumnNameLength(length int) error {
+	if length < 0 {
+		return fmt.Errorf("invalid negative column name length %d", length)
+	}
+	if length > maxColumnNameLength {
+		return fmt.Errorf("column name length %d exceeds maximum %d", length, maxColumnNameLength)
+	}
+	return nil
+}
+
 // BaseColumn implements common column functionality.
 type BaseColumn struct {
 	name    string
@@ -135,6 +172,34 @@ func (c *BaseColumn) Name() string {
 }
 
 func (c *BaseColumn) Value(buf []byte) (driver.Value, error) {
+	var required int
+	switch c.CType {
+	case api.SQL_C_BIT:
+		required = 1
+	case api.SQL_C_LONG:
+		required = 4
+	case api.SQL_C_SBIGINT, api.SQL_C_DOUBLE:
+		required = 8
+	case api.SQL_C_TYPE_TIMESTAMP:
+		required = int(unsafe.Sizeof(api.SQL_TIMESTAMP_STRUCT{}))
+	case api.SQL_C_GUID:
+		required = int(unsafe.Sizeof(api.SQLGUID{}))
+	case api.SQL_C_DATE:
+		required = int(unsafe.Sizeof(api.SQL_DATE_STRUCT{}))
+	case api.SQL_C_TIME:
+		required = int(unsafe.Sizeof(api.SQL_TIME_STRUCT{}))
+	case api.SQL_C_BINARY:
+		if c.SQLType == api.SQL_SS_TIME2 {
+			required = int(unsafe.Sizeof(api.SQL_SS_TIME2_STRUCT{}))
+		}
+	case api.SQL_C_WCHAR:
+		if len(buf)%2 != 0 {
+			return nil, fmt.Errorf("invalid odd byte length %d for UTF-16 column", len(buf))
+		}
+	}
+	if len(buf) < required {
+		return nil, fmt.Errorf("column ctype %d requires %d bytes, got %d", c.CType, required, len(buf))
+	}
 	var p unsafe.Pointer
 	if len(buf) > 0 {
 		p = unsafe.Pointer(&buf[0])
@@ -249,6 +314,9 @@ func NewVariableWidthColumn(b *BaseColumn, ctype api.SQLSMALLINT, colWidth api.S
 }
 
 func (c *BindableColumn) Bind(h api.SQLHSTMT, idx int) (bool, error) {
+	if len(c.Buffer) == 0 {
+		return false, fmt.Errorf("column #%d has an empty bind buffer", idx)
+	}
 	c.boundLen = new(BufferLen)
 	c.pinner = &runtime.Pinner{}
 	c.pinner.Pin(&c.Buffer[0])
@@ -277,10 +345,19 @@ func (c *BindableColumn) Value(h api.SQLHSTMT, idx int) (driver.Value, error) {
 	} else {
 		length = c.boundLen
 	}
+	if length == nil {
+		return nil, fmt.Errorf("column #%d has no length indicator", idx)
+	}
 	c.Len = *length
 	if c.Len.IsNull() {
 		// is NULL
 		return nil, nil
+	}
+	if c.Len < 0 {
+		return nil, fmt.Errorf("column #%d returned invalid length %d", idx, c.Len)
+	}
+	if c.Len > BufferLen(len(c.Buffer)) {
+		return nil, fmt.Errorf("column #%d returned length %d larger than buffer %d", idx, c.Len, len(c.Buffer))
 	}
 	if !c.IsVariableWidth && int(c.Len) != c.Size {
 		return nil, fmt.Errorf("wrong column #%d length %d returned, %d expected", idx, c.Len, c.Size)
@@ -326,12 +403,21 @@ loop:
 				// is NULL
 				return nil, nil
 			}
-			if int(l) > len(b) {
+			if l < 0 {
+				return nil, fmt.Errorf("invalid data length %d returned", l)
+			}
+			if l > BufferLen(len(b)) {
 				return nil, fmt.Errorf("too much data returned: %d bytes returned, but buffer size is %d", l, cap(b))
 			}
 			total = append(total, b[:l]...)
 			break loop
 		case api.SQL_SUCCESS_WITH_INFO:
+			if l.IsNull() {
+				return nil, nil
+			}
+			if l < 0 && l != api.SQL_NO_TOTAL {
+				return nil, fmt.Errorf("invalid data length %d returned", l)
+			}
 			diagnosticErr := NewError("SQLGetData", h)
 			err, ok := diagnosticErr.(*Error)
 			if !ok {
@@ -357,16 +443,6 @@ loop:
 				i-- // remove null-termination character
 			}
 			total = append(total, b[:i]...)
-			if l != api.SQL_NO_TOTAL {
-				// odbc gives us a hint about remaining data,
-				// lets get it in one go.
-				n := int(l) // total bytes for our data
-				n -= i      // subtract already received
-				n += 2      // room for biggest (wchar) null-terminator
-				if len(b) < n {
-					b = make([]byte, n)
-				}
-			}
 		default:
 			return nil, NewError("SQLGetData", h)
 		}

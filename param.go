@@ -93,7 +93,7 @@ func (p *Parameter) BindValue(h api.SQLHSTMT, idx int, v driver.Value, conn *Con
 			sqltype = api.SQL_WLONGVARCHAR
 		}
 	case int64:
-		if -0x80000000 < d && d < 0x7fffffff {
+		if int64FitsInt32(d) {
 			// Some ODBC drivers do not support SQL_BIGINT.
 			// Use SQL_INTEGER if the value fit in int32.
 			// See issue #78 for details.
@@ -208,6 +208,10 @@ func (p *Parameter) BindValue(h api.SQLHSTMT, idx int, v driver.Value, conn *Con
 	}
 	p.releasePreviousBindings(oldPinner)
 	return nil
+}
+
+func int64FitsInt32(value int64) bool {
+	return -0x80000000 <= value && value <= 0x7fffffff
 }
 
 func (p *Parameter) retainPreviousBinding(data interface{}, indicator *api.SQLLEN, pinner *runtime.Pinner) {

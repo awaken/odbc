@@ -20,7 +20,7 @@ type Stmt struct {
 }
 
 func (c *Conn) Prepare(query string) (driver.Stmt, error) {
-	if c.bad {
+	if !c.IsValid() {
 		return nil, driver.ErrBadConn
 	}
 	os, err := c.PrepareODBCStmt(query)
@@ -49,6 +49,9 @@ func (s *Stmt) Close() error {
 func (s *Stmt) Exec(args []driver.Value) (driver.Result, error) {
 	if s.os == nil {
 		return nil, errors.New("Stmt is closed")
+	}
+	if !s.c.IsValid() {
+		return nil, driver.ErrBadConn
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -97,6 +100,9 @@ func (s *Stmt) Exec(args []driver.Value) (driver.Result, error) {
 func (s *Stmt) Query(args []driver.Value) (driver.Rows, error) {
 	if s.os == nil {
 		return nil, errors.New("Stmt is closed")
+	}
+	if !s.c.IsValid() {
+		return nil, driver.ErrBadConn
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -7,6 +7,7 @@
 package api
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"runtime"
@@ -99,8 +100,11 @@ func openDriverManager(candidates []string, openLibrary openLibraryFunc) (string
 	var failures []string
 	for _, candidate := range candidates {
 		handle, err := safeOpenLibrary(candidate, purego.RTLD_NOW|purego.RTLD_GLOBAL, openLibrary)
-		if err == nil {
+		if err == nil && handle != 0 {
 			return candidate, handle, nil
+		}
+		if err == nil {
+			err = errors.New("native loader returned a null handle")
 		}
 		failures = append(failures, fmt.Sprintf("%q: %v", candidate, err))
 	}

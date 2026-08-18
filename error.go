@@ -13,6 +13,8 @@ import (
 	"github.com/alexbrainman/odbc/api"
 )
 
+const maxDiagnosticRecords = 256
+
 func IsError(ret api.SQLRETURN) bool {
 	return !(ret == api.SQL_SUCCESS || ret == api.SQL_SUCCESS_WITH_INFO)
 }
@@ -50,7 +52,7 @@ func NewError(apiName string, handle interface{}) error {
 	var msglen api.SQLSMALLINT
 	state := make([]uint16, 6)
 	msg := make([]uint16, api.SQL_MAX_MESSAGE_LENGTH)
-	for i := 1; ; i++ {
+	for i := 1; i <= maxDiagnosticRecords; i++ {
 		ret, callErr := safeSQLCall("SQLGetDiagRec", func() api.SQLRETURN {
 			return api.SQLGetDiagRec(ht, h, api.SQLSMALLINT(i),
 				(*api.SQLWCHAR)(unsafe.Pointer(&state[0])), &ne,
@@ -61,7 +63,7 @@ func NewError(apiName string, handle interface{}) error {
 			return callErr
 		}
 		if ret == api.SQL_NO_DATA {
-			break
+			return err
 		}
 		if IsError(ret) {
 			return fmt.Errorf("SQLGetDiagRec failed: ret=%d", ret)
@@ -71,10 +73,14 @@ func NewError(apiName string, handle interface{}) error {
 			NativeError: int(ne),
 			Message:     api.UTF16ToString(msg),
 		}
-		if r.State == "08S01" {
+		if isConnectionFailureState(r.State) {
 			return driver.ErrBadConn
 		}
 		err.Diag = append(err.Diag, r)
 	}
-	return err
+	return fmt.Errorf("SQLGetDiagRec exceeded %d diagnostic records: %w", maxDiagnosticRecords, err)
+}
+
+func isConnectionFailureState(state string) bool {
+	return strings.HasPrefix(state, "08")
 }

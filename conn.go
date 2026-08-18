@@ -21,6 +21,8 @@ type Conn struct {
 	isMSAccessDriver bool
 }
 
+var _ driver.Validator = (*Conn)(nil)
+
 var accessDriverSubstr = strings.ToUpper(strings.Replace("DRIVER={Microsoft Access Driver", " ", "", -1))
 
 func (d *Driver) Open(dsn string) (driver.Conn, error) {
@@ -60,8 +62,11 @@ func (d *Driver) Open(dsn string) (driver.Conn, error) {
 }
 
 func (c *Conn) Close() (err error) {
+	if c.h == api.SQLHDBC(api.SQL_NULL_HDBC) {
+		return nil
+	}
 	if c.tx != nil {
-		c.tx.Rollback()
+		err = c.tx.Rollback()
 	}
 	h := c.h
 	defer func() {
@@ -83,9 +88,15 @@ func (c *Conn) Close() (err error) {
 	return err
 }
 
+// IsValid reports whether the connection can safely return to database/sql's
+// idle pool.
+func (c *Conn) IsValid() bool {
+	return !c.bad && c.h != api.SQLHDBC(api.SQL_NULL_HDBC)
+}
+
 func (c *Conn) newError(apiName string, handle interface{}) error {
 	err := NewError(apiName, handle)
-	if err == driver.ErrBadConn {
+	if errors.Is(err, driver.ErrBadConn) {
 		c.bad = true
 	}
 	return err
@@ -95,6 +106,12 @@ func (c *Conn) newError(apiName string, handle interface{}) error {
 // As per the specifications, it honours the context timeout and returns when the context is cancelled.
 // When the context is cancelled, it first cancels the statement, closes it, and then returns an error.
 func (c *Conn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !c.IsValid() {
+		return nil, driver.ErrBadConn
+	}
 	// prepare the statement
 	dargs, err := namedValueToValue(args)
 	if err != nil {
@@ -105,11 +122,6 @@ func (c *Conn) QueryContext(ctx context.Context, query string, args []driver.Nam
 		return nil, err
 	}
 	defer os.closeByStmt()
-
-	// check if context is canceled before executing the query
-	if ctx.Err() != nil {
-		return nil, ctx.Err()
-	}
 
 	// execute the statement
 	rowsChan := make(chan driver.Rows)

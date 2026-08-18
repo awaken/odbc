@@ -47,6 +47,15 @@ func TestOpenDriverManagerReportsEveryFailure(t *testing.T) {
 	}
 }
 
+func TestOpenDriverManagerRejectsNullHandle(t *testing.T) {
+	_, _, err := openDriverManager([]string{"broken"}, func(path string, mode int) (uintptr, error) {
+		return 0, nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "null handle") {
+		t.Fatalf("openDriverManager error is %v; want null handle failure", err)
+	}
+}
+
 func TestOpenDriverManagerRecoversLoaderPanic(t *testing.T) {
 	_, _, err := openDriverManager([]string{"broken"}, func(path string, mode int) (uintptr, error) {
 		panic("loader failure")

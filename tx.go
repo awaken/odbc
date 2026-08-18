@@ -34,18 +34,17 @@ func (c *Conn) setAutoCommitAttr(a uintptr) error {
 }
 
 func (c *Conn) Begin() (driver.Tx, error) {
-	if c.bad {
+	if !c.IsValid() {
 		return nil, driver.ErrBadConn
 	}
 	if c.tx != nil {
 		return nil, errors.New("already in a transaction")
 	}
-	c.tx = &Tx{c: c}
-	err := c.setAutoCommitAttr(api.SQL_AUTOCOMMIT_OFF)
-	if err != nil {
+	if err := c.setAutoCommitAttr(api.SQL_AUTOCOMMIT_OFF); err != nil {
 		c.bad = true
 		return nil, err
 	}
+	c.tx = &Tx{c: c}
 	return c.tx, nil
 }
 
