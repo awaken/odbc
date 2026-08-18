@@ -200,11 +200,12 @@ func (p *Parameter) BindValue(h api.SQLHSTMT, idx int, v driver.Value, conn *Con
 	runtime.KeepAlive(p.Data)
 	if callErr != nil {
 		p.retainPreviousBinding(oldData, oldIndicator, oldPinner)
+		conn.invalidate()
 		return callErr
 	}
 	if IsError(ret) {
 		p.retainPreviousBinding(oldData, oldIndicator, oldPinner)
-		return NewError("SQLBindParameter", h)
+		return conn.newError("SQLBindParameter", h)
 	}
 	p.releasePreviousBindings(oldPinner)
 	return nil

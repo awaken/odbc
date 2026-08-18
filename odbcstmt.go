@@ -51,6 +51,7 @@ func (c *Conn) PrepareODBCStmt(query string) (*ODBCStmt, error) {
 		return api.SQLAllocHandle(api.SQL_HANDLE_STMT, api.SQLHANDLE(c.h), &out)
 	})
 	if callErr != nil {
+		c.invalidate()
 		return nil, callErr
 	}
 	if IsError(ret) {
@@ -59,6 +60,7 @@ func (c *Conn) PrepareODBCStmt(query string) (*ODBCStmt, error) {
 	h := api.SQLHSTMT(out)
 	err := drv.Stats.updateHandleCount(api.SQL_HANDLE_STMT, 1)
 	if err != nil {
+		defer releaseHandle(h)
 		return nil, err
 	}
 
@@ -68,6 +70,7 @@ func (c *Conn) PrepareODBCStmt(query string) (*ODBCStmt, error) {
 	})
 	if callErr != nil {
 		defer releaseHandle(h)
+		c.invalidate()
 		return nil, callErr
 	}
 	if IsError(ret) {
@@ -77,6 +80,7 @@ func (c *Conn) PrepareODBCStmt(query string) (*ODBCStmt, error) {
 	ps, err := ExtractParameters(h)
 	if err != nil {
 		defer releaseHandle(h)
+		c.invalidate()
 		return nil, err
 	}
 	return &ODBCStmt{
@@ -178,6 +182,7 @@ func (s *ODBCStmt) Exec(args []driver.Value, conn *Conn) error {
 		return api.SQLExecute(s.h)
 	})
 	if callErr != nil {
+		conn.invalidate()
 		return callErr
 	}
 	if ret == api.SQL_NO_DATA {
@@ -185,22 +190,23 @@ func (s *ODBCStmt) Exec(args []driver.Value, conn *Conn) error {
 		return nil
 	}
 	if IsError(ret) {
-		return NewError("SQLExecute", s.h)
+		return conn.newError("SQLExecute", s.h)
 	}
 	return nil
 }
 
-func (s *ODBCStmt) BindColumns() error {
+func (s *ODBCStmt) BindColumns(conn *Conn) error {
 	// count columns
 	var n api.SQLSMALLINT
 	ret, callErr := safeSQLCall("SQLNumResultCols", func() api.SQLRETURN {
 		return api.SQLNumResultCols(s.h, &n)
 	})
 	if callErr != nil {
+		conn.invalidate()
 		return callErr
 	}
 	if IsError(ret) {
-		return NewError("SQLNumResultCols", s.h)
+		return conn.newError("SQLNumResultCols", s.h)
 	}
 	if n < 1 {
 		return errors.New("Stmt did not create a result set")
@@ -214,6 +220,7 @@ func (s *ODBCStmt) BindColumns() error {
 	for i := range s.Cols {
 		c, err := NewColumn(s.h, i)
 		if err != nil {
+			conn.invalidate()
 			return err
 		}
 		s.Cols[i] = c
@@ -228,6 +235,7 @@ func (s *ODBCStmt) BindColumns() error {
 		}
 		bound, err := s.Cols[i].Bind(s.h, i)
 		if err != nil {
+			conn.invalidate()
 			return err
 		}
 		if !bound {
@@ -237,15 +245,16 @@ func (s *ODBCStmt) BindColumns() error {
 	return nil
 }
 
-func (s *ODBCStmt) Cancel() error {
+func (s *ODBCStmt) Cancel(conn *Conn) error {
 	ret, callErr := safeSQLCall("SQLCancel", func() api.SQLRETURN {
 		return api.SQLCancel(s.h)
 	})
 	if callErr != nil {
+		conn.invalidate()
 		return callErr
 	}
 	if IsError(ret) {
-		return NewError("SQLCancel", s.h)
+		return conn.newError("SQLCancel", s.h)
 	}
 
 	return nil

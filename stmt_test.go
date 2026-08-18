@@ -11,7 +11,9 @@ import (
 )
 
 func TestStmtRejectsBadConnection(t *testing.T) {
-	statement := &Stmt{c: &Conn{bad: true}, os: new(ODBCStmt)}
+	connection := &Conn{h: 1}
+	connection.invalidate()
+	statement := &Stmt{c: connection, os: new(ODBCStmt)}
 	if _, err := statement.Exec(nil); !errors.Is(err, driver.ErrBadConn) {
 		t.Fatalf("Exec error = %v; want %v", err, driver.ErrBadConn)
 	}

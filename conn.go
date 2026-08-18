@@ -9,6 +9,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"unsafe"
 
 	"github.com/alexbrainman/odbc/api"
@@ -17,7 +18,7 @@ import (
 type Conn struct {
 	h                api.SQLHDBC
 	tx               *Tx
-	bad              bool
+	bad              atomic.Bool
 	isMSAccessDriver bool
 }
 
@@ -91,13 +92,17 @@ func (c *Conn) Close() (err error) {
 // IsValid reports whether the connection can safely return to database/sql's
 // idle pool.
 func (c *Conn) IsValid() bool {
-	return !c.bad && c.h != api.SQLHDBC(api.SQL_NULL_HDBC)
+	return !c.bad.Load() && c.h != api.SQLHDBC(api.SQL_NULL_HDBC)
+}
+
+func (c *Conn) invalidate() {
+	c.bad.Store(true)
 }
 
 func (c *Conn) newError(apiName string, handle interface{}) error {
 	err := NewError(apiName, handle)
 	if errors.Is(err, driver.ErrBadConn) {
-		c.bad = true
+		c.invalidate()
 	}
 	return err
 }
@@ -121,7 +126,11 @@ func (c *Conn) QueryContext(ctx context.Context, query string, args []driver.Nam
 	if err != nil {
 		return nil, err
 	}
-	defer os.closeByStmt()
+	defer func() {
+		if closeErr := os.closeByStmt(); closeErr != nil {
+			c.invalidate()
+		}
+	}()
 
 	// execute the statement
 	rowsChan := make(chan driver.Rows)
@@ -133,7 +142,7 @@ func (c *Conn) QueryContext(ctx context.Context, query string, args []driver.Nam
 			return
 		}
 		os.usedByRows = true
-		rowsChan <- &Rows{os: os}
+		rowsChan <- &Rows{os: os, c: c}
 	}()
 	return c.waitQuery(ctx, os, rowsChan, errorChan)
 }
@@ -145,7 +154,7 @@ func (c *Conn) wrapQuery(ctx context.Context, os *ODBCStmt, dargs []driver.Value
 		return err
 	}
 
-	if err := os.BindColumns(); err != nil {
+	if err := os.BindColumns(c); err != nil {
 		return err
 	}
 	return nil
@@ -158,7 +167,7 @@ func (c *Conn) waitQuery(ctx context.Context, os *ODBCStmt, rowsChan <-chan driv
 	select {
 	case <-ctx.Done():
 		// context has been cancelled or has expired, cancel the statement and ignore the os.Cancel error
-		os.Cancel()
+		_ = os.Cancel(c)
 		// the statement has been cancelled, the query execution should eventually succeed or fail now
 		select {
 		// ignore the ODBC error and return ctx.Err() instead

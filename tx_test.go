@@ -25,7 +25,7 @@ func TestBeginFailureDoesNotLeaveActiveTransaction(t *testing.T) {
 	if connection.tx != nil {
 		t.Fatalf("Begin retained failed transaction %#v", connection.tx)
 	}
-	if !connection.bad {
+	if !connection.bad.Load() {
 		t.Fatal("Begin did not mark the connection bad")
 	}
 }

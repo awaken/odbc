@@ -13,6 +13,7 @@ import (
 
 type Rows struct {
 	os *ODBCStmt
+	c  *Conn
 }
 
 func (r *Rows) Columns() []string {
@@ -28,17 +29,19 @@ func (r *Rows) Next(dest []driver.Value) error {
 		return api.SQLFetch(r.os.h)
 	})
 	if callErr != nil {
+		r.c.invalidate()
 		return callErr
 	}
 	if ret == api.SQL_NO_DATA {
 		return io.EOF
 	}
 	if IsError(ret) {
-		return NewError("SQLFetch", r.os.h)
+		return r.c.newError("SQLFetch", r.os.h)
 	}
 	for i := range dest {
 		v, err := r.os.Cols[i].Value(r.os.h, i)
 		if err != nil {
+			r.c.invalidate()
 			return err
 		}
 		dest[i] = v
@@ -47,7 +50,11 @@ func (r *Rows) Next(dest []driver.Value) error {
 }
 
 func (r *Rows) Close() error {
-	return r.os.closeByRows()
+	err := r.os.closeByRows()
+	if err != nil {
+		r.c.invalidate()
+	}
+	return err
 }
 
 func (r *Rows) HasNextResultSet() bool {
@@ -59,16 +66,17 @@ func (r *Rows) NextResultSet() error {
 		return api.SQLMoreResults(r.os.h)
 	})
 	if callErr != nil {
+		r.c.invalidate()
 		return callErr
 	}
 	if ret == api.SQL_NO_DATA {
 		return io.EOF
 	}
 	if IsError(ret) {
-		return NewError("SQLMoreResults", r.os.h)
+		return r.c.newError("SQLMoreResults", r.os.h)
 	}
 
-	err := r.os.BindColumns()
+	err := r.os.BindColumns(r.c)
 	if err != nil {
 		return err
 	}

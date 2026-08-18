@@ -41,7 +41,7 @@ func (c *Conn) Begin() (driver.Tx, error) {
 		return nil, errors.New("already in a transaction")
 	}
 	if err := c.setAutoCommitAttr(api.SQL_AUTOCOMMIT_OFF); err != nil {
-		c.bad = true
+		c.invalidate()
 		return nil, err
 	}
 	c.tx = &Tx{c: c}
@@ -62,17 +62,17 @@ func (c *Conn) endTx(commit bool) error {
 		return api.SQLEndTran(api.SQL_HANDLE_DBC, api.SQLHANDLE(c.h), howToEnd)
 	})
 	if callErr != nil {
-		c.bad = true
+		c.invalidate()
 		return callErr
 	}
 	if IsError(ret) {
-		c.bad = true
+		c.invalidate()
 		return c.newError("SQLEndTran", c.h)
 	}
 	c.tx = nil
 	err := c.setAutoCommitAttr(api.SQL_AUTOCOMMIT_ON)
 	if err != nil {
-		c.bad = true
+		c.invalidate()
 		return err
 	}
 	return nil

@@ -43,6 +43,9 @@ func (s *Stmt) Close() error {
 	}
 	ret := s.os.closeByStmt()
 	s.os = nil
+	if ret != nil {
+		s.c.invalidate()
+	}
 	return ret
 }
 
@@ -56,7 +59,10 @@ func (s *Stmt) Exec(args []driver.Value) (driver.Result, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.os.usedByRows {
-		s.os.closeByStmt()
+		if err := s.os.closeByStmt(); err != nil {
+			s.c.invalidate()
+			return nil, err
+		}
 		s.os = nil
 		os, err := s.c.PrepareODBCStmt(s.query)
 		if err != nil {
@@ -75,23 +81,25 @@ func (s *Stmt) Exec(args []driver.Value) (driver.Result, error) {
 			return api.SQLRowCount(s.os.h, &c)
 		})
 		if callErr != nil {
+			s.c.invalidate()
 			return nil, callErr
 		}
 		if IsError(ret) {
-			return nil, NewError("SQLRowCount", s.os.h)
+			return nil, s.c.newError("SQLRowCount", s.os.h)
 		}
 		sumRowCount += int64(c)
 		ret, callErr = safeSQLCall("SQLMoreResults", func() api.SQLRETURN {
 			return api.SQLMoreResults(s.os.h)
 		})
 		if callErr != nil {
+			s.c.invalidate()
 			return nil, callErr
 		}
 		if ret == api.SQL_NO_DATA {
 			break
 		}
 		if IsError(ret) {
-			return nil, NewError("SQLMoreResults", s.os.h)
+			return nil, s.c.newError("SQLMoreResults", s.os.h)
 		}
 	}
 	return &Result{rowCount: sumRowCount}, nil
@@ -107,7 +115,10 @@ func (s *Stmt) Query(args []driver.Value) (driver.Rows, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.os.usedByRows {
-		s.os.closeByStmt()
+		if err := s.os.closeByStmt(); err != nil {
+			s.c.invalidate()
+			return nil, err
+		}
 		s.os = nil
 		os, err := s.c.PrepareODBCStmt(s.query)
 		if err != nil {
@@ -119,10 +130,10 @@ func (s *Stmt) Query(args []driver.Value) (driver.Rows, error) {
 	if err != nil {
 		return nil, err
 	}
-	err = s.os.BindColumns()
+	err = s.os.BindColumns(s.c)
 	if err != nil {
 		return nil, err
 	}
 	s.os.usedByRows = true // now both Stmt and Rows refer to it
-	return &Rows{os: s.os}, nil
+	return &Rows{os: s.os, c: s.c}, nil
 }
