@@ -3,7 +3,6 @@
 // license that can be found in the LICENSE file.
 
 // Package odbc implements database/sql driver to access data via odbc interface.
-//
 package odbc
 
 import (
@@ -13,15 +12,20 @@ import (
 )
 
 const (
+	// DriverPoolModeNone indicates that ODBC connection pooling is disabled.
 	DriverPoolModeNone  DriverPoolMode = 0
+	// DriverPoolModeBasic indicates that ODBC connection pooling is enabled.
 	DriverPoolModeBasic DriverPoolMode = 1
+	// DriverPoolModeFull indicates that pooling and relaxed connection matching are enabled.
 	DriverPoolModeFull  DriverPoolMode = 2
 )
 
+// DriverPoolMode describes the connection pooling capabilities enabled by the ODBC driver manager.
 type DriverPoolMode int
 
 var drv Driver
 
+// Driver implements database/sql/driver.Driver through an ODBC environment.
 type Driver struct {
 	Stats
 	h        api.SQLHENV // environment handle
@@ -29,18 +33,22 @@ type Driver struct {
 	poolMode DriverPoolMode
 }
 
+// PoolMode returns the connection pooling mode enabled during driver initialization.
 func (d *Driver) PoolMode() DriverPoolMode {
 	return d.poolMode
 }
 
+// IsPooling reports whether connection pooling is enabled.
 func (d *Driver) IsPooling() bool {
 	return d.poolMode != DriverPoolModeNone
 }
 
+// IsFullPooling reports whether connection pooling uses relaxed connection matching.
 func (d *Driver) IsFullPooling() bool {
 	return d.poolMode == DriverPoolModeFull
 }
 
+// Close releases the ODBC environment handle owned by d.
 func (d *Driver) Close() error {
 	// TODO(brainman): who will call (*Driver).Close (to dispose all opened handles)?
 	h := d.h
