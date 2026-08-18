@@ -36,7 +36,12 @@ func releaseHandle(handle interface{}) error {
 	if err != nil {
 		return err
 	}
-	ret := api.SQLFreeHandle(ht, h)
+	ret, callErr := safeSQLCall("SQLFreeHandle", func() api.SQLRETURN {
+		return api.SQLFreeHandle(ht, h)
+	})
+	if callErr != nil {
+		return callErr
+	}
 	if ret == api.SQL_INVALID_HANDLE {
 		return fmt.Errorf("SQLFreeHandle(%d, %d) returns SQL_INVALID_HANDLE", ht, h)
 	}

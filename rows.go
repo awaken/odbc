@@ -24,7 +24,12 @@ func (r *Rows) Columns() []string {
 }
 
 func (r *Rows) Next(dest []driver.Value) error {
-	ret := api.SQLFetch(r.os.h)
+	ret, callErr := safeSQLCall("SQLFetch", func() api.SQLRETURN {
+		return api.SQLFetch(r.os.h)
+	})
+	if callErr != nil {
+		return callErr
+	}
 	if ret == api.SQL_NO_DATA {
 		return io.EOF
 	}
@@ -50,7 +55,12 @@ func (r *Rows) HasNextResultSet() bool {
 }
 
 func (r *Rows) NextResultSet() error {
-	ret := api.SQLMoreResults(r.os.h)
+	ret, callErr := safeSQLCall("SQLMoreResults", func() api.SQLRETURN {
+		return api.SQLMoreResults(r.os.h)
+	})
+	if callErr != nil {
+		return callErr
+	}
 	if ret == api.SQL_NO_DATA {
 		return io.EOF
 	}

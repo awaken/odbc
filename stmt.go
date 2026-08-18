@@ -68,13 +68,27 @@ func (s *Stmt) Exec(args []driver.Value) (driver.Result, error) {
 	var sumRowCount int64
 	for {
 		var c api.SQLLEN
-		ret := api.SQLRowCount(s.os.h, &c)
+		ret, callErr := safeSQLCall("SQLRowCount", func() api.SQLRETURN {
+			return api.SQLRowCount(s.os.h, &c)
+		})
+		if callErr != nil {
+			return nil, callErr
+		}
 		if IsError(ret) {
 			return nil, NewError("SQLRowCount", s.os.h)
 		}
 		sumRowCount += int64(c)
-		if ret = api.SQLMoreResults(s.os.h); ret == api.SQL_NO_DATA {
+		ret, callErr = safeSQLCall("SQLMoreResults", func() api.SQLRETURN {
+			return api.SQLMoreResults(s.os.h)
+		})
+		if callErr != nil {
+			return nil, callErr
+		}
+		if ret == api.SQL_NO_DATA {
 			break
+		}
+		if IsError(ret) {
+			return nil, NewError("SQLMoreResults", s.os.h)
 		}
 	}
 	return &Result{rowCount: sumRowCount}, nil

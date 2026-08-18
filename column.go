@@ -8,6 +8,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"runtime"
 	"time"
 	"unsafe"
 
@@ -20,16 +21,20 @@ func (l *BufferLen) IsNull() bool {
 	return *l == api.SQL_NULL_DATA
 }
 
-func (l *BufferLen) GetData(h api.SQLHSTMT, idx int, ctype api.SQLSMALLINT, buf []byte) api.SQLRETURN {
-	return api.SQLGetData(h, api.SQLUSMALLINT(idx+1), ctype,
-		api.SQLPOINTER(unsafe.Pointer(&buf[0])), api.SQLLEN(len(buf)),
-		(*api.SQLLEN)(l))
+func (l *BufferLen) GetData(h api.SQLHSTMT, idx int, ctype api.SQLSMALLINT, buf []byte) (api.SQLRETURN, error) {
+	return safeSQLCall("SQLGetData", func() api.SQLRETURN {
+		return api.SQLGetData(h, api.SQLUSMALLINT(idx+1), ctype,
+			api.SQLPOINTER(unsafe.Pointer(&buf[0])), api.SQLLEN(len(buf)),
+			(*api.SQLLEN)(l))
+	})
 }
 
-func (l *BufferLen) Bind(h api.SQLHSTMT, idx int, ctype api.SQLSMALLINT, buf []byte) api.SQLRETURN {
-	return api.SQLBindCol(h, api.SQLUSMALLINT(idx+1), ctype,
-		api.SQLPOINTER(unsafe.Pointer(&buf[0])), api.SQLLEN(len(buf)),
-		(*api.SQLLEN)(l))
+func (l *BufferLen) Bind(h api.SQLHSTMT, idx int, ctype api.SQLSMALLINT, buf []byte) (api.SQLRETURN, error) {
+	return safeSQLCall("SQLBindCol", func() api.SQLRETURN {
+		return api.SQLBindCol(h, api.SQLUSMALLINT(idx+1), ctype,
+			api.SQLPOINTER(unsafe.Pointer(&buf[0])), api.SQLLEN(len(buf)),
+			(*api.SQLLEN)(l))
+	})
 }
 
 // Column provides access to row columns.
@@ -39,24 +44,32 @@ type Column interface {
 	Value(h api.SQLHSTMT, idx int) (driver.Value, error)
 }
 
-func describeColumn(h api.SQLHSTMT, idx int, namebuf []uint16) (namelen int, sqltype api.SQLSMALLINT, size api.SQLULEN, ret api.SQLRETURN) {
+func describeColumn(h api.SQLHSTMT, idx int, namebuf []uint16) (namelen int, sqltype api.SQLSMALLINT, size api.SQLULEN, ret api.SQLRETURN, err error) {
 	var l, decimal, nullable api.SQLSMALLINT
-	ret = api.SQLDescribeCol(h, api.SQLUSMALLINT(idx+1),
-		(*api.SQLWCHAR)(unsafe.Pointer(&namebuf[0])),
-		api.SQLSMALLINT(len(namebuf)), &l,
-		&sqltype, &size, &decimal, &nullable)
-	return int(l), sqltype, size, ret
+	ret, err = safeSQLCall("SQLDescribeCol", func() api.SQLRETURN {
+		return api.SQLDescribeCol(h, api.SQLUSMALLINT(idx+1),
+			(*api.SQLWCHAR)(unsafe.Pointer(&namebuf[0])),
+			api.SQLSMALLINT(len(namebuf)), &l,
+			&sqltype, &size, &decimal, &nullable)
+	})
+	return int(l), sqltype, size, ret, err
 }
 
 // TODO(brainman): did not check for MS SQL timestamp
 
 func NewColumn(h api.SQLHSTMT, idx int) (Column, error) {
 	namebuf := make([]uint16, 150)
-	namelen, sqltype, size, ret := describeColumn(h, idx, namebuf)
+	namelen, sqltype, size, ret, callErr := describeColumn(h, idx, namebuf)
+	if callErr != nil {
+		return nil, callErr
+	}
 	if ret == api.SQL_SUCCESS_WITH_INFO && namelen > len(namebuf) {
 		// try again with bigger buffer
 		namebuf = make([]uint16, namelen)
-		namelen, sqltype, size, ret = describeColumn(h, idx, namebuf)
+		namelen, sqltype, size, ret, callErr = describeColumn(h, idx, namebuf)
+		if callErr != nil {
+			return nil, callErr
+		}
 	}
 	if IsError(ret) {
 		return nil, NewError("SQLDescribeCol", h)
@@ -196,6 +209,8 @@ type BindableColumn struct {
 	Size            int
 	Len             BufferLen
 	Buffer          []byte
+	boundLen        *BufferLen
+	pinner          *runtime.Pinner
 }
 
 // TODO(brainman): BindableColumn.Buffer is used by external code after external code returns - that needs to be avoided in the future
@@ -234,7 +249,14 @@ func NewVariableWidthColumn(b *BaseColumn, ctype api.SQLSMALLINT, colWidth api.S
 }
 
 func (c *BindableColumn) Bind(h api.SQLHSTMT, idx int) (bool, error) {
-	ret := c.Len.Bind(h, idx, c.CType, c.Buffer)
+	c.boundLen = new(BufferLen)
+	c.pinner = &runtime.Pinner{}
+	c.pinner.Pin(&c.Buffer[0])
+	c.pinner.Pin(c.boundLen)
+	ret, callErr := c.boundLen.Bind(h, idx, c.CType, c.Buffer)
+	if callErr != nil {
+		return false, callErr
+	}
 	if IsError(ret) {
 		return false, NewError("SQLBindCol", h)
 	}
@@ -243,12 +265,19 @@ func (c *BindableColumn) Bind(h api.SQLHSTMT, idx int) (bool, error) {
 }
 
 func (c *BindableColumn) Value(h api.SQLHSTMT, idx int) (driver.Value, error) {
+	length := &c.Len
 	if !c.IsBound {
-		ret := c.Len.GetData(h, idx, c.CType, c.Buffer)
+		ret, callErr := length.GetData(h, idx, c.CType, c.Buffer)
+		if callErr != nil {
+			return nil, callErr
+		}
 		if IsError(ret) {
 			return nil, NewError("SQLGetData", h)
 		}
+	} else {
+		length = c.boundLen
 	}
+	c.Len = *length
 	if c.Len.IsNull() {
 		// is NULL
 		return nil, nil
@@ -257,6 +286,14 @@ func (c *BindableColumn) Value(h api.SQLHSTMT, idx int) (driver.Value, error) {
 		return nil, fmt.Errorf("wrong column #%d length %d returned, %d expected", idx, c.Len, c.Size)
 	}
 	return c.BaseColumn.Value(c.Buffer[:c.Len])
+}
+
+func (c *BindableColumn) unpin() {
+	if c.pinner != nil {
+		c.pinner.Unpin()
+		c.pinner = nil
+	}
+	c.boundLen = nil
 }
 
 // NonBindableColumn provide access to columns, that can't be bound.
@@ -270,13 +307,19 @@ func (c *NonBindableColumn) Bind(h api.SQLHSTMT, idx int) (bool, error) {
 	return false, nil
 }
 
+func (c *NonBindableColumn) unpin() {
+}
+
 func (c *NonBindableColumn) Value(h api.SQLHSTMT, idx int) (driver.Value, error) {
 	var l BufferLen
 	var total []byte
 	b := make([]byte, 1024)
 loop:
 	for {
-		ret := l.GetData(h, idx, c.CType, b)
+		ret, callErr := l.GetData(h, idx, c.CType, b)
+		if callErr != nil {
+			return nil, callErr
+		}
 		switch ret {
 		case api.SQL_SUCCESS:
 			if l.IsNull() {
@@ -289,7 +332,11 @@ loop:
 			total = append(total, b[:l]...)
 			break loop
 		case api.SQL_SUCCESS_WITH_INFO:
-			err := NewError("SQLGetData", h).(*Error)
+			diagnosticErr := NewError("SQLGetData", h)
+			err, ok := diagnosticErr.(*Error)
+			if !ok {
+				return nil, diagnosticErr
+			}
 			if len(err.Diag) > 0 {
 				truncated := false
 				for _, diag := range err.Diag {

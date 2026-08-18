@@ -7,6 +7,7 @@ package odbc
 import (
 	"database/sql/driver"
 	"fmt"
+	"runtime"
 	"time"
 	"unsafe"
 
@@ -22,6 +23,10 @@ type Parameter struct {
 	// The fields keep data alive and away from gc.
 	Data             interface{}
 	StrLen_or_IndPtr api.SQLLEN
+	indicator        *api.SQLLEN
+	pinner           *runtime.Pinner
+	retiredData      []interface{}
+	retiredPinners   []*runtime.Pinner
 }
 
 // StoreStrLen_or_IndPtr stores v into StrLen_or_IndPtr field of p
@@ -40,6 +45,11 @@ func (p *Parameter) BindValue(h api.SQLHSTMT, idx int, v driver.Value, conn *Con
 	var buflen api.SQLLEN
 	var plen *api.SQLLEN
 	var buf unsafe.Pointer
+	var indicatorValue api.SQLLEN
+	var hasIndicator bool
+	oldData := p.Data
+	oldIndicator := p.indicator
+	oldPinner := p.pinner
 	switch d := v.(type) {
 	case nil:
 		ctype = api.SQL_C_WCHAR
@@ -47,7 +57,8 @@ func (p *Parameter) BindValue(h api.SQLHSTMT, idx int, v driver.Value, conn *Con
 		buf = nil
 		size = 1
 		buflen = 0
-		plen = p.StoreStrLen_or_IndPtr(api.SQL_NULL_DATA)
+		indicatorValue = api.SQL_NULL_DATA
+		hasIndicator = true
 		sqltype = api.SQL_WCHAR
 	case string:
 		ctype = api.SQL_C_WCHAR
@@ -63,7 +74,8 @@ func (p *Parameter) BindValue(h api.SQLHSTMT, idx int, v driver.Value, conn *Con
 		}
 		l *= 2 // every char takes 2 bytes
 		buflen = api.SQLLEN(l)
-		plen = p.StoreStrLen_or_IndPtr(buflen)
+		indicatorValue = buflen
+		hasIndicator = true
 		if !conn.isMSAccessDriver {
 			switch {
 			case size >= 4000:
@@ -148,7 +160,8 @@ func (p *Parameter) BindValue(h api.SQLHSTMT, idx int, v driver.Value, conn *Con
 			buf = nil
 		}
 		buflen = api.SQLLEN(len(b))
-		plen = p.StoreStrLen_or_IndPtr(buflen)
+		indicatorValue = buflen
+		hasIndicator = true
 		size = api.SQLULEN(len(b))
 		switch {
 		case p.isDescribed:
@@ -163,19 +176,78 @@ func (p *Parameter) BindValue(h api.SQLHSTMT, idx int, v driver.Value, conn *Con
 	default:
 		return fmt.Errorf("unsupported type %T", v)
 	}
-	ret := api.SQLBindParameter(h, api.SQLUSMALLINT(idx+1),
-		api.SQL_PARAM_INPUT, ctype, sqltype, size, decimal,
-		api.SQLPOINTER(buf), buflen, plen)
+	p.StrLen_or_IndPtr = indicatorValue
+	p.indicator = nil
+	if hasIndicator {
+		p.indicator = new(api.SQLLEN)
+		*p.indicator = indicatorValue
+		plen = p.indicator
+	}
+	newPinner := &runtime.Pinner{}
+	if buf != nil {
+		newPinner.Pin(buf)
+	}
+	if plen != nil {
+		newPinner.Pin(plen)
+	}
+	p.pinner = newPinner
+
+	ret, callErr := safeSQLCall("SQLBindParameter", func() api.SQLRETURN {
+		return api.SQLBindParameter(h, api.SQLUSMALLINT(idx+1),
+			api.SQL_PARAM_INPUT, ctype, sqltype, size, decimal,
+			api.SQLPOINTER(buf), buflen, plen)
+	})
+	runtime.KeepAlive(p.Data)
+	if callErr != nil {
+		p.retainPreviousBinding(oldData, oldIndicator, oldPinner)
+		return callErr
+	}
 	if IsError(ret) {
+		p.retainPreviousBinding(oldData, oldIndicator, oldPinner)
 		return NewError("SQLBindParameter", h)
 	}
+	p.releasePreviousBindings(oldPinner)
 	return nil
+}
+
+func (p *Parameter) retainPreviousBinding(data interface{}, indicator *api.SQLLEN, pinner *runtime.Pinner) {
+	if pinner == nil {
+		return
+	}
+	p.retiredData = append(p.retiredData, data, indicator)
+	p.retiredPinners = append(p.retiredPinners, pinner)
+}
+
+func (p *Parameter) releasePreviousBindings(previous *runtime.Pinner) {
+	if previous != nil {
+		previous.Unpin()
+	}
+	for _, pinner := range p.retiredPinners {
+		pinner.Unpin()
+	}
+	p.retiredData = nil
+	p.retiredPinners = nil
+}
+
+func (p *Parameter) unpin() {
+	if p.pinner != nil {
+		p.pinner.Unpin()
+		p.pinner = nil
+	}
+	p.releasePreviousBindings(nil)
+	p.Data = nil
+	p.indicator = nil
 }
 
 func ExtractParameters(h api.SQLHSTMT) ([]Parameter, error) {
 	// count parameters
 	var n, nullable api.SQLSMALLINT
-	ret := api.SQLNumParams(h, &n)
+	ret, callErr := safeSQLCall("SQLNumParams", func() api.SQLRETURN {
+		return api.SQLNumParams(h, &n)
+	})
+	if callErr != nil {
+		return nil, callErr
+	}
 	if IsError(ret) {
 		return nil, NewError("SQLNumParams", h)
 	}
@@ -187,8 +259,13 @@ func ExtractParameters(h api.SQLHSTMT) ([]Parameter, error) {
 	// fetch param descriptions
 	for i := range ps {
 		p := &ps[i]
-		ret = api.SQLDescribeParam(h, api.SQLUSMALLINT(i+1),
-			&p.SQLType, &p.Size, &p.Decimal, &nullable)
+		ret, callErr = safeSQLCall("SQLDescribeParam", func() api.SQLRETURN {
+			return api.SQLDescribeParam(h, api.SQLUSMALLINT(i+1),
+				&p.SQLType, &p.Size, &p.Decimal, &nullable)
+		})
+		if callErr != nil {
+			return nil, callErr
+		}
 		if IsError(ret) {
 			// SQLDescribeParam is not implemented by freedts,
 			// it even fails for some statements on windows.

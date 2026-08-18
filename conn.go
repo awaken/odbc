@@ -24,12 +24,17 @@ type Conn struct {
 var accessDriverSubstr = strings.ToUpper(strings.Replace("DRIVER={Microsoft Access Driver", " ", "", -1))
 
 func (d *Driver) Open(dsn string) (driver.Conn, error) {
-	if d.initErr != nil {
-		return nil, d.initErr
+	if err := d.initialize(); err != nil {
+		return nil, err
 	}
 
 	var out api.SQLHANDLE
-	ret := api.SQLAllocHandle(api.SQL_HANDLE_DBC, api.SQLHANDLE(d.h), &out)
+	ret, callErr := safeSQLCall("SQLAllocHandle", func() api.SQLRETURN {
+		return api.SQLAllocHandle(api.SQL_HANDLE_DBC, api.SQLHANDLE(d.h), &out)
+	})
+	if callErr != nil {
+		return nil, callErr
+	}
 	if IsError(ret) {
 		return nil, NewError("SQLAllocHandle", d.h)
 	}
@@ -37,9 +42,15 @@ func (d *Driver) Open(dsn string) (driver.Conn, error) {
 	drv.Stats.updateHandleCount(api.SQL_HANDLE_DBC, 1)
 
 	b := api.StringToUTF16(dsn)
-	ret = api.SQLDriverConnect(h, 0,
-		(*api.SQLWCHAR)(unsafe.Pointer(&b[0])), api.SQL_NTS,
-		nil, 0, nil, api.SQL_DRIVER_NOPROMPT)
+	ret, callErr = safeSQLCall("SQLDriverConnect", func() api.SQLRETURN {
+		return api.SQLDriverConnect(h, 0,
+			(*api.SQLWCHAR)(unsafe.Pointer(&b[0])), api.SQL_NTS,
+			nil, 0, nil, api.SQL_DRIVER_NOPROMPT)
+	})
+	if callErr != nil {
+		defer releaseHandle(h)
+		return nil, callErr
+	}
 	if IsError(ret) {
 		defer releaseHandle(h)
 		return nil, NewError("SQLDriverConnect", h)
@@ -60,7 +71,12 @@ func (c *Conn) Close() (err error) {
 			err = e
 		}
 	}()
-	ret := api.SQLDisconnect(c.h)
+	ret, callErr := safeSQLCall("SQLDisconnect", func() api.SQLRETURN {
+		return api.SQLDisconnect(c.h)
+	})
+	if callErr != nil {
+		return callErr
+	}
 	if IsError(ret) {
 		return c.newError("SQLDisconnect", h)
 	}

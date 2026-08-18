@@ -2,163 +2,157 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build darwin linux freebsd
-// +build cgo
+//go:build !windows
 
 package api
 
-// #cgo darwin,amd64 LDFLAGS: -L /usr/local/opt/unixodbc/lib -lodbc
-// #cgo darwin,amd64 CFLAGS: -I /usr/local/opt/unixodbc/include
-// #cgo darwin,arm64 LDFLAGS: -L /opt/homebrew/opt/unixodbc/lib -lodbc
-// #cgo darwin,arm64 CFLAGS: -I /opt/homebrew/opt/unixodbc/include
-// #cgo linux LDFLAGS: -lodbc
-// #cgo freebsd LDFLAGS: -L /usr/local/lib -lodbc
-// #cgo freebsd CFLAGS: -I/usr/local/include
-// #include <sql.h>
-// #include <sqlext.h>
-// #include <stdint.h>
-/*
-SQLRETURN sqlSetEnvUIntPtrAttr(SQLHENV environmentHandle, SQLINTEGER attribute, uintptr_t valuePtr, SQLINTEGER stringLength) {
-	return SQLSetEnvAttr(environmentHandle, attribute, (SQLPOINTER)valuePtr, stringLength);
-}
-
-SQLRETURN sqlSetConnectUIntPtrAttr(SQLHDBC connectionHandle, SQLINTEGER attribute, uintptr_t valuePtr, SQLINTEGER stringLength) {
-	return SQLSetConnectAttr(connectionHandle, attribute, (SQLPOINTER)valuePtr, stringLength);
-}
-*/
-import "C"
+import "unsafe"
 
 const (
-	SQL_OV_ODBC3 = uintptr(C.SQL_OV_ODBC3)
+	// DriverManagerEnvironment names the environment variable that overrides
+	// the native ODBC driver manager library path.
+	DriverManagerEnvironment = "ODBC_DRIVER_MANAGER_LIBRARY"
 
-	SQL_ATTR_ODBC_VERSION = C.SQL_ATTR_ODBC_VERSION
+	SQL_OV_ODBC3 = uintptr(3)
 
-	SQL_DRIVER_NOPROMPT = C.SQL_DRIVER_NOPROMPT
+	SQL_ATTR_ODBC_VERSION = 200
 
-	SQL_HANDLE_ENV  = C.SQL_HANDLE_ENV
-	SQL_HANDLE_DBC  = C.SQL_HANDLE_DBC
-	SQL_HANDLE_STMT = C.SQL_HANDLE_STMT
+	SQL_DRIVER_NOPROMPT = 0
 
-	SQL_SUCCESS            = C.SQL_SUCCESS
-	SQL_SUCCESS_WITH_INFO  = C.SQL_SUCCESS_WITH_INFO
-	SQL_INVALID_HANDLE     = C.SQL_INVALID_HANDLE
-	SQL_NO_DATA            = C.SQL_NO_DATA
-	SQL_NO_TOTAL           = C.SQL_NO_TOTAL
-	SQL_NTS                = C.SQL_NTS
-	SQL_MAX_MESSAGE_LENGTH = C.SQL_MAX_MESSAGE_LENGTH
-	SQL_NULL_HANDLE        = uintptr(C.SQL_NULL_HANDLE)
-	SQL_NULL_HENV          = uintptr(C.SQL_NULL_HENV)
-	SQL_NULL_HDBC          = uintptr(C.SQL_NULL_HDBC)
-	SQL_NULL_HSTMT         = uintptr(C.SQL_NULL_HSTMT)
+	SQL_HANDLE_ENV  = 1
+	SQL_HANDLE_DBC  = 2
+	SQL_HANDLE_STMT = 3
 
-	SQL_PARAM_INPUT = C.SQL_PARAM_INPUT
+	SQL_SUCCESS            = 0
+	SQL_SUCCESS_WITH_INFO  = 1
+	SQL_ERROR              = -1
+	SQL_INVALID_HANDLE     = -2
+	SQL_NO_DATA            = 100
+	SQL_NO_TOTAL           = -4
+	SQL_NTS                = -3
+	SQL_MAX_MESSAGE_LENGTH = 512
+	SQL_NULL_HANDLE        = 0
+	SQL_NULL_HENV          = 0
+	SQL_NULL_HDBC          = 0
+	SQL_NULL_HSTMT         = 0
 
-	SQL_NULL_DATA    = C.SQL_NULL_DATA
-	SQL_DATA_AT_EXEC = C.SQL_DATA_AT_EXEC
+	SQL_PARAM_INPUT = 1
 
-	SQL_UNKNOWN_TYPE    = C.SQL_UNKNOWN_TYPE
-	SQL_CHAR            = C.SQL_CHAR
-	SQL_NUMERIC         = C.SQL_NUMERIC
-	SQL_DECIMAL         = C.SQL_DECIMAL
-	SQL_INTEGER         = C.SQL_INTEGER
-	SQL_SMALLINT        = C.SQL_SMALLINT
-	SQL_FLOAT           = C.SQL_FLOAT
-	SQL_REAL            = C.SQL_REAL
-	SQL_DOUBLE          = C.SQL_DOUBLE
-	SQL_DATETIME        = C.SQL_DATETIME
-	SQL_DATE            = C.SQL_DATE
-	SQL_TIME            = C.SQL_TIME
-	SQL_VARCHAR         = C.SQL_VARCHAR
-	SQL_TYPE_DATE       = C.SQL_TYPE_DATE
-	SQL_TYPE_TIME       = C.SQL_TYPE_TIME
-	SQL_TYPE_TIMESTAMP  = C.SQL_TYPE_TIMESTAMP
-	SQL_TIMESTAMP       = C.SQL_TIMESTAMP
-	SQL_LONGVARCHAR     = C.SQL_LONGVARCHAR
-	SQL_BINARY          = C.SQL_BINARY
-	SQL_VARBINARY       = C.SQL_VARBINARY
-	SQL_LONGVARBINARY   = C.SQL_LONGVARBINARY
-	SQL_BIGINT          = C.SQL_BIGINT
-	SQL_TINYINT         = C.SQL_TINYINT
-	SQL_BIT             = C.SQL_BIT
-	SQL_WCHAR           = C.SQL_WCHAR
-	SQL_WVARCHAR        = C.SQL_WVARCHAR
-	SQL_WLONGVARCHAR    = C.SQL_WLONGVARCHAR
-	SQL_GUID            = C.SQL_GUID
-	SQL_SIGNED_OFFSET   = C.SQL_SIGNED_OFFSET
-	SQL_UNSIGNED_OFFSET = C.SQL_UNSIGNED_OFFSET
+	SQL_NULL_DATA    = -1
+	SQL_DATA_AT_EXEC = -2
 
-	// TODO(lukemauldin): Not defined in sqlext.h. Using windows value, but it is not supported.
+	SQL_UNKNOWN_TYPE    = 0
+	SQL_CHAR            = 1
+	SQL_NUMERIC         = 2
+	SQL_DECIMAL         = 3
+	SQL_INTEGER         = 4
+	SQL_SMALLINT        = 5
+	SQL_FLOAT           = 6
+	SQL_REAL            = 7
+	SQL_DOUBLE          = 8
+	SQL_DATETIME        = 9
+	SQL_DATE            = 9
+	SQL_TIME            = 10
+	SQL_VARCHAR         = 12
+	SQL_TYPE_DATE       = 91
+	SQL_TYPE_TIME       = 92
+	SQL_TYPE_TIMESTAMP  = 93
+	SQL_TIMESTAMP       = 11
+	SQL_LONGVARCHAR     = -1
+	SQL_BINARY          = -2
+	SQL_VARBINARY       = -3
+	SQL_LONGVARBINARY   = -4
+	SQL_BIGINT          = -5
+	SQL_TINYINT         = -6
+	SQL_BIT             = -7
+	SQL_WCHAR           = -8
+	SQL_WVARCHAR        = -9
+	SQL_WLONGVARCHAR    = -10
+	SQL_GUID            = -11
+	SQL_SIGNED_OFFSET   = -20
+	SQL_UNSIGNED_OFFSET = -22
+
+	// TODO(lukemauldin): Not defined in sqlext.h. Using the Windows
+	// values, although they are not supported by every Unix driver.
 	SQL_SS_XML   = -152
 	SQL_SS_TIME2 = -154
 
-	SQL_C_CHAR           = C.SQL_C_CHAR
-	SQL_C_LONG           = C.SQL_C_LONG
-	SQL_C_SHORT          = C.SQL_C_SHORT
-	SQL_C_FLOAT          = C.SQL_C_FLOAT
-	SQL_C_DOUBLE         = C.SQL_C_DOUBLE
-	SQL_C_NUMERIC        = C.SQL_C_NUMERIC
-	SQL_C_DATE           = C.SQL_C_DATE
-	SQL_C_TIME           = C.SQL_C_TIME
-	SQL_C_TYPE_TIMESTAMP = C.SQL_C_TYPE_TIMESTAMP
-	SQL_C_TIMESTAMP      = C.SQL_C_TIMESTAMP
-	SQL_C_BINARY         = C.SQL_C_BINARY
-	SQL_C_BIT            = C.SQL_C_BIT
-	SQL_C_WCHAR          = C.SQL_C_WCHAR
-	SQL_C_DEFAULT        = C.SQL_C_DEFAULT
-	SQL_C_SBIGINT        = C.SQL_C_SBIGINT
-	SQL_C_UBIGINT        = C.SQL_C_UBIGINT
-	SQL_C_GUID           = C.SQL_C_GUID
+	SQL_C_CHAR           = SQL_CHAR
+	SQL_C_LONG           = SQL_INTEGER
+	SQL_C_SHORT          = SQL_SMALLINT
+	SQL_C_FLOAT          = SQL_REAL
+	SQL_C_DOUBLE         = SQL_DOUBLE
+	SQL_C_NUMERIC        = SQL_NUMERIC
+	SQL_C_DATE           = SQL_DATE
+	SQL_C_TIME           = SQL_TIME
+	SQL_C_TYPE_TIMESTAMP = SQL_TYPE_TIMESTAMP
+	SQL_C_TIMESTAMP      = SQL_TIMESTAMP
+	SQL_C_BINARY         = SQL_BINARY
+	SQL_C_BIT            = SQL_BIT
+	SQL_C_WCHAR          = SQL_WCHAR
+	SQL_C_DEFAULT        = 99
+	SQL_C_SBIGINT        = SQL_BIGINT + SQL_SIGNED_OFFSET
+	SQL_C_UBIGINT        = SQL_BIGINT + SQL_UNSIGNED_OFFSET
+	SQL_C_GUID           = SQL_GUID
 
-	SQL_COMMIT   = C.SQL_COMMIT
-	SQL_ROLLBACK = C.SQL_ROLLBACK
+	SQL_COMMIT   = 0
+	SQL_ROLLBACK = 1
 
-	SQL_AUTOCOMMIT         = C.SQL_AUTOCOMMIT
-	SQL_ATTR_AUTOCOMMIT    = C.SQL_ATTR_AUTOCOMMIT
-	SQL_AUTOCOMMIT_OFF     = C.SQL_AUTOCOMMIT_OFF
-	SQL_AUTOCOMMIT_ON      = C.SQL_AUTOCOMMIT_ON
-	SQL_AUTOCOMMIT_DEFAULT = C.SQL_AUTOCOMMIT_DEFAULT
+	SQL_AUTOCOMMIT         = 102
+	SQL_ATTR_AUTOCOMMIT    = SQL_AUTOCOMMIT
+	SQL_AUTOCOMMIT_OFF     = 0
+	SQL_AUTOCOMMIT_ON      = 1
+	SQL_AUTOCOMMIT_DEFAULT = SQL_AUTOCOMMIT_ON
 
-	SQL_IS_UINTEGER = C.SQL_IS_UINTEGER
+	SQL_IS_UINTEGER = -5
 
-	//Connection pooling
-	SQL_ATTR_CONNECTION_POOLING = C.SQL_ATTR_CONNECTION_POOLING
-	SQL_ATTR_CP_MATCH           = C.SQL_ATTR_CP_MATCH
-	SQL_CP_OFF                  = uintptr(C.SQL_CP_OFF)
-	SQL_CP_ONE_PER_DRIVER       = uintptr(C.SQL_CP_ONE_PER_DRIVER)
-	SQL_CP_ONE_PER_HENV         = uintptr(C.SQL_CP_ONE_PER_HENV)
+	// Connection pooling.
+	SQL_ATTR_CONNECTION_POOLING = 201
+	SQL_ATTR_CP_MATCH           = 202
+	SQL_CP_OFF                  = 0
+	SQL_CP_ONE_PER_DRIVER       = 1
+	SQL_CP_ONE_PER_HENV         = uintptr(2)
 	SQL_CP_DEFAULT              = SQL_CP_OFF
-	SQL_CP_STRICT_MATCH         = uintptr(C.SQL_CP_STRICT_MATCH)
-	SQL_CP_RELAXED_MATCH        = uintptr(C.SQL_CP_RELAXED_MATCH)
+	SQL_CP_STRICT_MATCH         = 0
+	SQL_CP_RELAXED_MATCH        = uintptr(1)
 )
 
 type (
-	SQLHANDLE C.SQLHANDLE
-	SQLHENV   C.SQLHENV
-	SQLHDBC   C.SQLHDBC
-	SQLHSTMT  C.SQLHSTMT
+	SQLHANDLE uintptr
+	SQLHENV   SQLHANDLE
+	SQLHDBC   SQLHANDLE
+	SQLHSTMT  SQLHANDLE
 	SQLHWND   uintptr
 
-	SQLWCHAR     C.SQLWCHAR
-	SQLSCHAR     C.SQLSCHAR
-	SQLSMALLINT  C.SQLSMALLINT
-	SQLUSMALLINT C.SQLUSMALLINT
-	SQLINTEGER   C.SQLINTEGER
-	SQLUINTEGER  C.SQLUINTEGER
-	SQLPOINTER   C.SQLPOINTER
-	SQLRETURN    C.SQLRETURN
+	SQLWCHAR     uint16
+	SQLSCHAR     int8
+	SQLSMALLINT  int16
+	SQLUSMALLINT uint16
+	SQLINTEGER   int32
+	SQLUINTEGER  uint32
+	SQLPOINTER   unsafe.Pointer
+	SQLRETURN    SQLSMALLINT
 
-	SQLLEN  C.SQLLEN
-	SQLULEN C.SQLULEN
+	// SQLLEN and SQLULEN follow the normal unixODBC ABI, where their size
+	// matches the native pointer size. Legacy 64-bit unixODBC builds are not
+	// binary compatible with this API.
+	SQLLEN  int
+	SQLULEN uint
 
-	SQLGUID C.SQLGUID
+	SQLGUID struct {
+		Data1 uint32
+		Data2 uint16
+		Data3 uint16
+		Data4 [8]byte
+	}
 )
 
-func SQLSetEnvUIntPtrAttr(environmentHandle SQLHENV, attribute SQLINTEGER, valuePtr uintptr, stringLength SQLINTEGER) (ret SQLRETURN) {
-	r := C.sqlSetEnvUIntPtrAttr(C.SQLHENV(environmentHandle), C.SQLINTEGER(attribute), C.uintptr_t(valuePtr), C.SQLINTEGER(stringLength))
-	return SQLRETURN(r)
+// SQLSetEnvUIntPtrAttr calls SQLSetEnvAttr with an integer-valued pointer.
+func SQLSetEnvUIntPtrAttr(environmentHandle SQLHENV, attribute SQLINTEGER, valuePtr uintptr, stringLength SQLINTEGER) SQLRETURN {
+	return sqlSetEnvUIntPtrAttr(environmentHandle, attribute, valuePtr, stringLength)
 }
 
-func SQLSetConnectUIntPtrAttr(connectionHandle SQLHDBC, attribute SQLINTEGER, valuePtr uintptr, stringLength SQLINTEGER) (ret SQLRETURN) {
-	r := C.sqlSetConnectUIntPtrAttr(C.SQLHDBC(connectionHandle), C.SQLINTEGER(attribute), C.uintptr_t(valuePtr), C.SQLINTEGER(stringLength))
-	return SQLRETURN(r)
+// SQLSetConnectUIntPtrAttr calls SQLSetConnectAttr with an integer-valued pointer.
+func SQLSetConnectUIntPtrAttr(connectionHandle SQLHDBC, attribute SQLINTEGER, valuePtr uintptr, stringLength SQLINTEGER) SQLRETURN {
+	return sqlSetConnectUIntPtrAttr(connectionHandle, attribute, valuePtr, stringLength)
 }

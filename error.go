@@ -51,10 +51,15 @@ func NewError(apiName string, handle interface{}) error {
 	state := make([]uint16, 6)
 	msg := make([]uint16, api.SQL_MAX_MESSAGE_LENGTH)
 	for i := 1; ; i++ {
-		ret := api.SQLGetDiagRec(ht, h, api.SQLSMALLINT(i),
-			(*api.SQLWCHAR)(unsafe.Pointer(&state[0])), &ne,
-			(*api.SQLWCHAR)(unsafe.Pointer(&msg[0])),
-			api.SQLSMALLINT(len(msg)), &msglen)
+		ret, callErr := safeSQLCall("SQLGetDiagRec", func() api.SQLRETURN {
+			return api.SQLGetDiagRec(ht, h, api.SQLSMALLINT(i),
+				(*api.SQLWCHAR)(unsafe.Pointer(&state[0])), &ne,
+				(*api.SQLWCHAR)(unsafe.Pointer(&msg[0])),
+				api.SQLSMALLINT(len(msg)), &msglen)
+		})
+		if callErr != nil {
+			return callErr
+		}
 		if ret == api.SQL_NO_DATA {
 			break
 		}

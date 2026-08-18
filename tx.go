@@ -21,7 +21,12 @@ func (c *Conn) setAutoCommitAttr(a uintptr) error {
 	if testBeginErr != nil {
 		return testBeginErr
 	}
-	ret := api.SQLSetConnectUIntPtrAttr(c.h, api.SQL_ATTR_AUTOCOMMIT, a, api.SQL_IS_UINTEGER)
+	ret, callErr := safeSQLCall("SQLSetConnectUIntPtrAttr", func() api.SQLRETURN {
+		return api.SQLSetConnectUIntPtrAttr(c.h, api.SQL_ATTR_AUTOCOMMIT, a, api.SQL_IS_UINTEGER)
+	})
+	if callErr != nil {
+		return callErr
+	}
 	if IsError(ret) {
 		return c.newError("SQLSetConnectUIntPtrAttr", c.h)
 	}
@@ -54,7 +59,13 @@ func (c *Conn) endTx(commit bool) error {
 	} else {
 		howToEnd = api.SQL_ROLLBACK
 	}
-	ret := api.SQLEndTran(api.SQL_HANDLE_DBC, api.SQLHANDLE(c.h), howToEnd)
+	ret, callErr := safeSQLCall("SQLEndTran", func() api.SQLRETURN {
+		return api.SQLEndTran(api.SQL_HANDLE_DBC, api.SQLHANDLE(c.h), howToEnd)
+	})
+	if callErr != nil {
+		c.bad = true
+		return callErr
+	}
 	if IsError(ret) {
 		c.bad = true
 		return c.newError("SQLEndTran", c.h)
