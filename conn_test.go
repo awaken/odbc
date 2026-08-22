@@ -15,14 +15,35 @@ import (
 func TestQueryContextStopsBeforeNativeCall(t *testing.T) {
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
+	if _, err := new(Conn).PrepareContext(cancelled, "select 1"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("PrepareContext cancelled error = %v; want %v", err, context.Canceled)
+	}
+	if _, err := new(Conn).ExecContext(cancelled, "select 1", nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("ExecContext cancelled error = %v; want %v", err, context.Canceled)
+	}
 	if _, err := new(Conn).QueryContext(cancelled, "select 1", nil); !errors.Is(err, context.Canceled) {
 		t.Fatalf("QueryContext cancelled error = %v; want %v", err, context.Canceled)
 	}
 
 	connection := &Conn{h: 1}
 	connection.invalidate()
+	if _, err := connection.PrepareContext(context.Background(), "select 1"); !errors.Is(err, driver.ErrBadConn) {
+		t.Fatalf("PrepareContext bad connection error = %v; want %v", err, driver.ErrBadConn)
+	}
+	if _, err := connection.ExecContext(context.Background(), "select 1", nil); !errors.Is(err, driver.ErrBadConn) {
+		t.Fatalf("ExecContext bad connection error = %v; want %v", err, driver.ErrBadConn)
+	}
 	if _, err := connection.QueryContext(context.Background(), "select 1", nil); !errors.Is(err, driver.ErrBadConn) {
 		t.Fatalf("QueryContext bad connection error = %v; want %v", err, driver.ErrBadConn)
+	}
+}
+
+func TestRejectsEmbeddedNULBeforeNativeCall(t *testing.T) {
+	if _, err := new(Driver).Open("DSN=valid\x00DSN=ignored"); err == nil {
+		t.Fatal("Open unexpectedly accepted a NUL-containing connection string")
+	}
+	if _, err := new(Conn).PrepareODBCStmt("select 1\x00select 2"); err == nil {
+		t.Fatal("PrepareODBCStmt unexpectedly accepted a NUL-containing query")
 	}
 }
 

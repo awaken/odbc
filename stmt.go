@@ -5,6 +5,7 @@
 package odbc
 
 import (
+	"context"
 	"database/sql/driver"
 	"errors"
 	"sync"
@@ -19,6 +20,9 @@ type Stmt struct {
 	mu    sync.Mutex
 }
 
+var _ driver.StmtExecContext = (*Stmt)(nil)
+var _ driver.StmtQueryContext = (*Stmt)(nil)
+
 func (c *Conn) Prepare(query string) (driver.Stmt, error) {
 	if !c.IsValid() {
 		return nil, driver.ErrBadConn
@@ -30,7 +34,25 @@ func (c *Conn) Prepare(query string) (driver.Stmt, error) {
 	return &Stmt{c: c, os: os, query: query}, nil
 }
 
+// PrepareContext prepares query and interrupts the native ODBC operation when
+// ctx is cancelled.
+func (c *Conn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !c.IsValid() {
+		return nil, driver.ErrBadConn
+	}
+	os, err := c.prepareODBCStmtContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	return &Stmt{c: c, os: os, query: query}, nil
+}
+
 func (s *Stmt) NumInput() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.os == nil {
 		return -1
 	}
@@ -38,6 +60,8 @@ func (s *Stmt) NumInput() int {
 }
 
 func (s *Stmt) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.os == nil {
 		return errors.New("Stmt is already closed")
 	}
@@ -50,46 +74,106 @@ func (s *Stmt) Close() error {
 }
 
 func (s *Stmt) Exec(args []driver.Value) (driver.Result, error) {
-	if s.os == nil {
-		return nil, errors.New("Stmt is closed")
-	}
-	if !s.c.IsValid() {
-		return nil, driver.ErrBadConn
-	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.os.usedByRows {
-		if err := s.os.closeByStmt(); err != nil {
-			s.c.invalidate()
-			return nil, err
-		}
-		s.os = nil
-		os, err := s.c.PrepareODBCStmt(s.query)
-		if err != nil {
-			return nil, err
-		}
-		s.os = os
+	if err := s.prepareForUse(s.c.PrepareODBCStmt); err != nil {
+		return nil, err
 	}
-	err := s.os.Exec(args, s.c)
+	return s.exec(s.os, args)
+}
+
+// ExecContext executes a prepared statement and interrupts its native ODBC
+// operation when ctx is cancelled.
+func (s *Stmt) ExecContext(ctx context.Context, args []driver.NamedValue) (driver.Result, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	dargs, err := namedValueToValue(args)
 	if err != nil {
 		return nil, err
 	}
+	return s.execContext(ctx, dargs)
+}
+
+func (s *Stmt) execContext(ctx context.Context, args []driver.Value) (driver.Result, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := s.prepareForUse(func(query string) (*ODBCStmt, error) {
+		return s.c.prepareODBCStmtContext(ctx, query)
+	}); err != nil {
+		return nil, err
+	}
+	os := s.os
+	if err := os.bind(args, s.c); err != nil {
+		return nil, err
+	}
+	return runContextOperation(ctx, func() (driver.Result, error) {
+		return s.execBound(os)
+	}, func() error {
+		return os.Cancel(s.c)
+	}, nil)
+}
+
+func (s *Stmt) prepareForUse(prepare func(string) (*ODBCStmt, error)) error {
+	if s.os == nil {
+		return errors.New("Stmt is closed")
+	}
+	if !s.c.IsValid() {
+		return driver.ErrBadConn
+	}
+	if !s.os.isUsedByRows() {
+		return nil
+	}
+	if err := s.os.closeByStmt(); err != nil {
+		s.c.invalidate()
+		return err
+	}
+	s.os = nil
+	os, err := prepare(s.query)
+	if err != nil {
+		return err
+	}
+	s.os = os
+	return nil
+}
+
+func (s *Stmt) exec(os *ODBCStmt, args []driver.Value) (driver.Result, error) {
+	if err := os.Exec(args, s.c); err != nil {
+		return nil, err
+	}
+	return s.execBoundResults(os)
+}
+
+func (s *Stmt) execBound(os *ODBCStmt) (driver.Result, error) {
+	if err := os.execute(s.c); err != nil {
+		return nil, err
+	}
+	return s.execBoundResults(os)
+}
+
+func (s *Stmt) execBoundResults(os *ODBCStmt) (driver.Result, error) {
 	var sumRowCount int64
 	for {
 		var c api.SQLLEN
 		ret, callErr := safeSQLCall("SQLRowCount", func() api.SQLRETURN {
-			return api.SQLRowCount(s.os.h, &c)
+			return api.SQLRowCount(os.h, &c)
 		})
 		if callErr != nil {
 			s.c.invalidate()
 			return nil, callErr
 		}
 		if IsError(ret) {
-			return nil, s.c.newError("SQLRowCount", s.os.h)
+			return nil, s.c.newError("SQLRowCount", os.h)
 		}
 		sumRowCount += int64(c)
 		ret, callErr = safeSQLCall("SQLMoreResults", func() api.SQLRETURN {
-			return api.SQLMoreResults(s.os.h)
+			return api.SQLMoreResults(os.h)
 		})
 		if callErr != nil {
 			s.c.invalidate()
@@ -99,41 +183,80 @@ func (s *Stmt) Exec(args []driver.Value) (driver.Result, error) {
 			break
 		}
 		if IsError(ret) {
-			return nil, s.c.newError("SQLMoreResults", s.os.h)
+			return nil, s.c.newError("SQLMoreResults", os.h)
 		}
 	}
 	return &Result{rowCount: sumRowCount}, nil
 }
 
 func (s *Stmt) Query(args []driver.Value) (driver.Rows, error) {
-	if s.os == nil {
-		return nil, errors.New("Stmt is closed")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.prepareForUse(s.c.PrepareODBCStmt); err != nil {
+		return nil, err
 	}
-	if !s.c.IsValid() {
-		return nil, driver.ErrBadConn
+	return s.queryStatement(s.os, args)
+}
+
+// QueryContext executes a prepared query and interrupts its native ODBC
+// operation when ctx is cancelled.
+func (s *Stmt) QueryContext(ctx context.Context, args []driver.NamedValue) (driver.Rows, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	dargs, err := namedValueToValue(args)
+	if err != nil {
+		return nil, err
+	}
+	return s.queryContext(ctx, dargs)
+}
+
+func (s *Stmt) queryContext(ctx context.Context, args []driver.Value) (driver.Rows, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.os.usedByRows {
-		if err := s.os.closeByStmt(); err != nil {
-			s.c.invalidate()
-			return nil, err
-		}
-		s.os = nil
-		os, err := s.c.PrepareODBCStmt(s.query)
-		if err != nil {
-			return nil, err
-		}
-		s.os = os
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	err := s.os.Exec(args, s.c)
+	if err := s.prepareForUse(func(query string) (*ODBCStmt, error) {
+		return s.c.prepareODBCStmtContext(ctx, query)
+	}); err != nil {
+		return nil, err
+	}
+	os := s.os
+	if err := os.bind(args, s.c); err != nil {
+		return nil, err
+	}
+	return runContextOperation(ctx, func() (driver.Rows, error) {
+		return s.queryBound(os)
+	}, func() error {
+		return os.Cancel(s.c)
+	}, func(rows driver.Rows) {
+		_ = rows.Close()
+	})
+}
+
+func (s *Stmt) queryStatement(os *ODBCStmt, args []driver.Value) (driver.Rows, error) {
+	if err := os.Exec(args, s.c); err != nil {
+		return nil, err
+	}
+	return s.queryBoundResults(os)
+}
+
+func (s *Stmt) queryBound(os *ODBCStmt) (driver.Rows, error) {
+	if err := os.execute(s.c); err != nil {
+		return nil, err
+	}
+	return s.queryBoundResults(os)
+}
+
+func (s *Stmt) queryBoundResults(os *ODBCStmt) (driver.Rows, error) {
+	err := os.BindColumns(s.c)
 	if err != nil {
 		return nil, err
 	}
-	err = s.os.BindColumns(s.c)
-	if err != nil {
-		return nil, err
-	}
-	s.os.usedByRows = true // now both Stmt and Rows refer to it
-	return &Rows{os: s.os, c: s.c}, nil
+	os.markUsedByRows() // now both Stmt and Rows refer to it
+	return &Rows{os: os, c: s.c}, nil
 }

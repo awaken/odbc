@@ -17,16 +17,23 @@ import (
 
 type Conn struct {
 	h                api.SQLHDBC
+	stats            *handleStats
 	tx               *Tx
 	bad              atomic.Bool
 	isMSAccessDriver bool
 }
 
+var _ driver.ConnPrepareContext = (*Conn)(nil)
+var _ driver.ExecerContext = (*Conn)(nil)
+var _ driver.QueryerContext = (*Conn)(nil)
 var _ driver.Validator = (*Conn)(nil)
 
 var accessDriverSubstr = strings.ToUpper(strings.Replace("DRIVER={Microsoft Access Driver", " ", "", -1))
 
 func (d *Driver) Open(dsn string) (driver.Conn, error) {
+	if strings.IndexByte(dsn, 0) >= 0 {
+		return nil, errors.New("ODBC connection string contains a NUL byte")
+	}
 	if err := d.initialize(); err != nil {
 		return nil, err
 	}
@@ -42,7 +49,7 @@ func (d *Driver) Open(dsn string) (driver.Conn, error) {
 		return nil, NewError("SQLAllocHandle", d.h)
 	}
 	h := api.SQLHDBC(out)
-	drv.Stats.updateHandleCount(api.SQL_HANDLE_DBC, 1)
+	d.stats.updateHandleCount(api.SQL_HANDLE_DBC, 1)
 
 	b := api.StringToUTF16(dsn)
 	ret, callErr = safeSQLCall("SQLDriverConnect", func() api.SQLRETURN {
@@ -51,15 +58,15 @@ func (d *Driver) Open(dsn string) (driver.Conn, error) {
 			nil, 0, nil, api.SQL_DRIVER_NOPROMPT)
 	})
 	if callErr != nil {
-		defer releaseHandle(h)
+		defer releaseHandle(h, &d.stats)
 		return nil, callErr
 	}
 	if IsError(ret) {
-		defer releaseHandle(h)
+		defer releaseHandle(h, &d.stats)
 		return nil, NewError("SQLDriverConnect", h)
 	}
 	isAccess := strings.Contains(strings.ToUpper(strings.Replace(dsn, " ", "", -1)), accessDriverSubstr)
-	return &Conn{h: h, isMSAccessDriver: isAccess}, nil
+	return &Conn{h: h, stats: &d.stats, isMSAccessDriver: isAccess}, nil
 }
 
 func (c *Conn) Close() (err error) {
@@ -72,7 +79,7 @@ func (c *Conn) Close() (err error) {
 	h := c.h
 	defer func() {
 		c.h = api.SQLHDBC(api.SQL_NULL_HDBC)
-		e := releaseHandle(h)
+		e := releaseHandle(h, c.stats)
 		if err == nil {
 			err = e
 		}
@@ -101,15 +108,44 @@ func (c *Conn) invalidate() {
 
 func (c *Conn) newError(apiName string, handle interface{}) error {
 	err := NewError(apiName, handle)
-	if errors.Is(err, driver.ErrBadConn) {
+	var diagnosticError *Error
+	if errors.As(err, &diagnosticError) && diagnosticError.connectionFailure() {
 		c.invalidate()
 	}
 	return err
 }
 
-// QueryContext implements the driver.QueryerContext interface.
-// As per the specifications, it honours the context timeout and returns when the context is cancelled.
-// When the context is cancelled, it first cancels the statement, closes it, and then returns an error.
+// ExecContext prepares and executes query, interrupting the native ODBC
+// operation when ctx is cancelled.
+func (c *Conn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !c.IsValid() {
+		return nil, driver.ErrBadConn
+	}
+	dargs, err := namedValueToValue(args)
+	if err != nil {
+		return nil, err
+	}
+	statement, err := c.PrepareContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	stmt := statement.(*Stmt)
+	result, operationErr := stmt.execContext(ctx, dargs)
+	closeErr := stmt.Close()
+	if operationErr != nil {
+		return nil, operationErr
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	return result, nil
+}
+
+// QueryContext prepares and executes query, interrupting the native ODBC
+// operation when ctx is cancelled.
 func (c *Conn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -117,70 +153,27 @@ func (c *Conn) QueryContext(ctx context.Context, query string, args []driver.Nam
 	if !c.IsValid() {
 		return nil, driver.ErrBadConn
 	}
-	// prepare the statement
 	dargs, err := namedValueToValue(args)
 	if err != nil {
 		return nil, err
 	}
-	os, err := c.PrepareODBCStmt(query)
+	statement, err := c.PrepareContext(ctx, query)
 	if err != nil {
 		return nil, err
 	}
-	defer func() {
-		if closeErr := os.closeByStmt(); closeErr != nil {
-			c.invalidate()
-		}
-	}()
-
-	// execute the statement
-	rowsChan := make(chan driver.Rows)
-	errorChan := make(chan error)
-	go func() {
-		err := c.wrapQuery(ctx, os, dargs)
-		if err != nil {
-			errorChan <- err
-			return
-		}
-		os.usedByRows = true
-		rowsChan <- &Rows{os: os, c: c}
-	}()
-	return c.waitQuery(ctx, os, rowsChan, errorChan)
-}
-
-// wrapQuery is following the same logic as `stmt.Query()` except that we don't use a lock
-// because the ODBC statement doesn't get exposed externally.
-func (c *Conn) wrapQuery(ctx context.Context, os *ODBCStmt, dargs []driver.Value) error {
-	if err := os.Exec(dargs, c); err != nil {
-		return err
+	stmt := statement.(*Stmt)
+	rows, operationErr := stmt.queryContext(ctx, dargs)
+	closeErr := stmt.Close()
+	if operationErr != nil {
+		return nil, operationErr
 	}
-
-	if err := os.BindColumns(c); err != nil {
-		return err
-	}
-	return nil
-}
-
-// waitQuery waits for either os rows or error to arrive from rowsChan and errorChan.
-// waitQuery also waits for ctx to signal completion.
-// The function returns received rows or the error.
-func (c *Conn) waitQuery(ctx context.Context, os *ODBCStmt, rowsChan <-chan driver.Rows, errorChan <-chan error) (driver.Rows, error) {
-	select {
-	case <-ctx.Done():
-		// context has been cancelled or has expired, cancel the statement and ignore the os.Cancel error
-		_ = os.Cancel(c)
-		// the statement has been cancelled, the query execution should eventually succeed or fail now
-		select {
-		// ignore the ODBC error and return ctx.Err() instead
-		case <-errorChan:
-			return nil, ctx.Err()
-		case rows := <-rowsChan:
-			return rows, nil
+	if closeErr != nil {
+		if rows != nil {
+			_ = rows.Close()
 		}
-	case err := <-errorChan:
-		return nil, err
-	case rows := <-rowsChan:
-		return rows, nil
+		return nil, closeErr
 	}
+	return rows, nil
 }
 
 // namedValueToValue is a utility function that converts a driver.NamedValue into a driver.Value.

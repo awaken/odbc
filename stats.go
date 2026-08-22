@@ -11,23 +11,45 @@ import (
 	"github.com/alexbrainman/odbc/api"
 )
 
+// Stats is a point-in-time snapshot of the native ODBC handles owned by a
+// Driver. A snapshot does not change after it is returned and is safe to read
+// concurrently with driver operations.
 type Stats struct {
+	// EnvCount is the number of allocated environment handles.
 	EnvCount  int
+	// ConnCount is the number of allocated connection handles.
 	ConnCount int
+	// StmtCount is the number of allocated statement handles.
 	StmtCount int
-	mu        sync.Mutex
 }
 
-func (s *Stats) updateHandleCount(handleType api.SQLSMALLINT, change int) error {
+type handleStats struct {
+	mu        sync.RWMutex
+	envCount  int
+	connCount int
+	stmtCount int
+}
+
+func (s *handleStats) snapshot() Stats {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return Stats{
+		EnvCount:  s.envCount,
+		ConnCount: s.connCount,
+		StmtCount: s.stmtCount,
+	}
+}
+
+func (s *handleStats) updateHandleCount(handleType api.SQLSMALLINT, change int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	switch handleType {
 	case api.SQL_HANDLE_ENV:
-		s.EnvCount += change
+		s.envCount += change
 	case api.SQL_HANDLE_DBC:
-		s.ConnCount += change
+		s.connCount += change
 	case api.SQL_HANDLE_STMT:
-		s.StmtCount += change
+		s.stmtCount += change
 	default:
 		return fmt.Errorf("unexpected handle type %d", handleType)
 	}

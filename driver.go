@@ -29,11 +29,17 @@ var drv Driver
 
 // Driver implements database/sql/driver.Driver through an ODBC environment.
 type Driver struct {
-	Stats
+	stats    handleStats
 	h        api.SQLHENV // environment handle
 	initOnce sync.Once
 	initErr  error
 	poolMode DriverPoolMode
+}
+
+// Stats returns a synchronized snapshot of the native handles currently owned
+// by d.
+func (d *Driver) Stats() Stats {
+	return d.stats.snapshot()
 }
 
 // PoolMode returns the connection pooling mode enabled during driver initialization.
@@ -59,7 +65,7 @@ func (d *Driver) Close() error {
 		return nil
 	}
 	d.h = api.SQLHENV(api.SQL_NULL_HENV)
-	return releaseHandle(h)
+	return releaseHandle(h, &d.stats)
 }
 
 func (d *Driver) initialize() error {
@@ -102,7 +108,7 @@ func (d *Driver) initDriver() error {
 		return NewError("SQLAllocHandle", api.SQLHENV(in))
 	}
 	d.h = api.SQLHENV(out)
-	err := d.Stats.updateHandleCount(api.SQL_HANDLE_ENV, 1)
+	err := d.stats.updateHandleCount(api.SQL_HANDLE_ENV, 1)
 	if err != nil {
 		d.Close()
 		return err

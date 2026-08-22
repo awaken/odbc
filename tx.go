@@ -5,8 +5,10 @@
 package odbc
 
 import (
+	"context"
 	"database/sql/driver"
 	"errors"
+	"fmt"
 
 	"github.com/alexbrainman/odbc/api"
 )
@@ -14,6 +16,8 @@ import (
 type Tx struct {
 	c *Conn
 }
+
+var _ driver.ConnBeginTx = (*Conn)(nil)
 
 var testBeginErr error // used during tests
 
@@ -34,6 +38,26 @@ func (c *Conn) setAutoCommitAttr(a uintptr) error {
 }
 
 func (c *Conn) Begin() (driver.Tx, error) {
+	return c.begin()
+}
+
+// BeginTx starts a transaction after validating ctx and the requested options.
+// ODBC transactions currently support only the default isolation level and
+// read-write mode. database/sql rolls the transaction back if ctx is cancelled.
+func (c *Conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if opts.Isolation != driver.IsolationLevel(0) {
+		return nil, fmt.Errorf("odbc: transaction isolation level %d is not supported", opts.Isolation)
+	}
+	if opts.ReadOnly {
+		return nil, errors.New("odbc: read-only transactions are not supported")
+	}
+	return c.begin()
+}
+
+func (c *Conn) begin() (driver.Tx, error) {
 	if !c.IsValid() {
 		return nil, driver.ErrBadConn
 	}

@@ -1,3 +1,5 @@
+//go:build odbc_integration
+
 // Copyright 2017 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
@@ -8,6 +10,7 @@ import (
 	"database/sql"
 	"flag"
 	"fmt"
+	"os"
 	"testing"
 	"time"
 )
@@ -16,7 +19,7 @@ var (
 	mysrv  = flag.String("mysrv", "server", "mysql server name")
 	mydb   = flag.String("mydb", "dbname", "mysql database name")
 	myuser = flag.String("myuser", "", "mysql user name")
-	mypass = flag.String("mypass", "", "mysql password")
+	mypass = flag.String("mypass", os.Getenv("ODBC_MYSQL_PASSWORD"), "mysql password")
 )
 
 func mysqlConnect() (db *sql.DB, stmtCount int, err error) {
@@ -27,7 +30,7 @@ func mysqlConnect() (db *sql.DB, stmtCount int, err error) {
 	if err != nil {
 		return nil, 0, err
 	}
-	stats := db.Driver().(*Driver).Stats
+	stats := db.Driver().(*Driver).Stats()
 	return db, stats.StmtCount, nil
 }
 

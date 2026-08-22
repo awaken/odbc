@@ -5,9 +5,11 @@
 package odbc
 
 import (
+	"context"
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 	"unsafe"
@@ -19,6 +21,7 @@ import (
 
 type ODBCStmt struct {
 	h           api.SQLHSTMT
+	stats       *handleStats
 	Parameters  []Parameter
 	Cols        []Column
 	retiredCols [][]Column
@@ -45,49 +48,98 @@ func releasePinnedStatement(statement *ODBCStmt) {
 	pinnedStatements.Unlock()
 }
 
+func (s *ODBCStmt) isUsedByRows() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.usedByRows
+}
+
+func (s *ODBCStmt) markUsedByRows() {
+	s.mu.Lock()
+	s.usedByRows = true
+	s.mu.Unlock()
+}
+
 func (c *Conn) PrepareODBCStmt(query string) (*ODBCStmt, error) {
+	s, queryText, err := c.allocateODBCStmt(query)
+	if err != nil {
+		return nil, err
+	}
+	if err = c.prepareAllocatedODBCStmt(s, queryText); err != nil {
+		c.closeFailedODBCStmt(s)
+		return nil, err
+	}
+	return s, nil
+}
+
+func (c *Conn) prepareODBCStmtContext(ctx context.Context, query string) (*ODBCStmt, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s, queryText, err := c.allocateODBCStmt(query)
+	if err != nil {
+		return nil, err
+	}
+	_, err = runContextOperation(ctx, func() (struct{}, error) {
+		return struct{}{}, c.prepareAllocatedODBCStmt(s, queryText)
+	}, func() error {
+		return s.Cancel(c)
+	}, nil)
+	if err != nil {
+		c.closeFailedODBCStmt(s)
+		return nil, err
+	}
+	return s, nil
+}
+
+func (c *Conn) allocateODBCStmt(query string) (*ODBCStmt, []uint16, error) {
+	if strings.IndexByte(query, 0) >= 0 {
+		return nil, nil, errors.New("ODBC query contains a NUL byte")
+	}
 	var out api.SQLHANDLE
 	ret, callErr := safeSQLCall("SQLAllocHandle", func() api.SQLRETURN {
 		return api.SQLAllocHandle(api.SQL_HANDLE_STMT, api.SQLHANDLE(c.h), &out)
 	})
 	if callErr != nil {
 		c.invalidate()
-		return nil, callErr
+		return nil, nil, callErr
 	}
 	if IsError(ret) {
-		return nil, c.newError("SQLAllocHandle", c.h)
+		return nil, nil, c.newError("SQLAllocHandle", c.h)
 	}
 	h := api.SQLHSTMT(out)
-	err := drv.Stats.updateHandleCount(api.SQL_HANDLE_STMT, 1)
+	err := c.stats.updateHandleCount(api.SQL_HANDLE_STMT, 1)
 	if err != nil {
-		defer releaseHandle(h)
-		return nil, err
+		defer releaseHandle(h, c.stats)
+		return nil, nil, err
 	}
+	return &ODBCStmt{h: h, stats: c.stats, usedByStmt: true}, api.StringToUTF16(query), nil
+}
 
-	b := api.StringToUTF16(query)
-	ret, callErr = safeSQLCall("SQLPrepare", func() api.SQLRETURN {
-		return api.SQLPrepare(h, (*api.SQLWCHAR)(unsafe.Pointer(&b[0])), api.SQL_NTS)
+func (c *Conn) prepareAllocatedODBCStmt(s *ODBCStmt, queryText []uint16) error {
+	ret, callErr := safeSQLCall("SQLPrepare", func() api.SQLRETURN {
+		return api.SQLPrepare(s.h, (*api.SQLWCHAR)(unsafe.Pointer(&queryText[0])), api.SQL_NTS)
 	})
 	if callErr != nil {
-		defer releaseHandle(h)
 		c.invalidate()
-		return nil, callErr
+		return callErr
 	}
 	if IsError(ret) {
-		defer releaseHandle(h)
-		return nil, c.newError("SQLPrepare", h)
+		return c.newError("SQLPrepare", s.h)
 	}
-	ps, err := ExtractParameters(h)
+	ps, err := ExtractParameters(s.h)
 	if err != nil {
-		defer releaseHandle(h)
 		c.invalidate()
-		return nil, err
+		return err
 	}
-	return &ODBCStmt{
-		h:          h,
-		Parameters: ps,
-		usedByStmt: true,
-	}, nil
+	s.Parameters = ps
+	return nil
+}
+
+func (c *Conn) closeFailedODBCStmt(s *ODBCStmt) {
+	if err := s.closeByStmt(); err != nil {
+		c.invalidate()
+	}
 }
 
 func (s *ODBCStmt) closeByStmt() error {
@@ -128,7 +180,7 @@ func (s *ODBCStmt) closeByRows() error {
 func (s *ODBCStmt) releaseHandle() error {
 	h := s.h
 	s.h = api.SQLHSTMT(api.SQL_NULL_HSTMT)
-	err := releaseHandle(h)
+	err := releaseHandle(h, s.stats)
 	if err != nil {
 		// Keep every retained Go buffer pinned if the driver manager did not
 		// confirm that the native statement handle was released.
@@ -159,6 +211,13 @@ func unpinColumns(columns []Column) {
 var testingIssue5 bool // used during tests
 
 func (s *ODBCStmt) Exec(args []driver.Value, conn *Conn) error {
+	if err := s.bind(args, conn); err != nil {
+		return err
+	}
+	return s.execute(conn)
+}
+
+func (s *ODBCStmt) bind(args []driver.Value, conn *Conn) error {
 	if len(args) != len(s.Parameters) {
 		return fmt.Errorf("wrong number of arguments %d, %d expected", len(args), len(s.Parameters))
 	}
@@ -175,6 +234,10 @@ func (s *ODBCStmt) Exec(args []driver.Value, conn *Conn) error {
 			return err
 		}
 	}
+	return nil
+}
+
+func (s *ODBCStmt) execute(conn *Conn) error {
 	if testingIssue5 {
 		time.Sleep(10 * time.Microsecond)
 	}

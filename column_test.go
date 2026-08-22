@@ -104,3 +104,30 @@ func TestNewColumnRejectsInvalidNameLength(t *testing.T) {
 		t.Fatalf("newColumn error = %v; want negative length error", err)
 	}
 }
+
+func TestNewColumnPreservesExactNumericAsText(t *testing.T) {
+	column, err := newColumn(1, 0, func(_ api.SQLHSTMT, _ int, buffer []uint16) (int, api.SQLSMALLINT, api.SQLULEN, api.SQLRETURN, error) {
+		copy(buffer, api.StringToUTF16("amount"))
+		return len("amount"), api.SQL_DECIMAL, 38, api.SQL_SUCCESS, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	numeric, ok := column.(*NonBindableColumn)
+	if !ok {
+		t.Fatalf("decimal column type = %T; want *NonBindableColumn", column)
+	}
+	if numeric.CType != api.SQL_C_CHAR {
+		t.Fatalf("decimal C type = %d; want SQL_C_CHAR", numeric.CType)
+	}
+
+	want := []byte("-12345678901234567890.123456789012345678")
+	got, err := numeric.BaseColumn.Value(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bytes, ok := got.([]byte)
+	if !ok || string(bytes) != string(want) {
+		t.Fatalf("decimal value = %T(%v); want exact bytes %q", got, got, want)
+	}
+}

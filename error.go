@@ -5,7 +5,6 @@
 package odbc
 
 import (
-	"database/sql/driver"
 	"fmt"
 	"strings"
 	"unsafe"
@@ -42,6 +41,15 @@ func (e *Error) Error() string {
 	return e.APIName + ": " + strings.Join(ss, "\n")
 }
 
+func (e *Error) connectionFailure() bool {
+	for _, record := range e.Diag {
+		if isConnectionFailureState(record.State) {
+			return true
+		}
+	}
+	return false
+}
+
 func NewError(apiName string, handle interface{}) error {
 	h, ht, herr := ToHandleAndType(handle)
 	if herr != nil {
@@ -72,9 +80,6 @@ func NewError(apiName string, handle interface{}) error {
 			State:       api.UTF16ToString(state),
 			NativeError: int(ne),
 			Message:     api.UTF16ToString(msg),
-		}
-		if isConnectionFailureState(r.State) {
-			return driver.ErrBadConn
 		}
 		err.Diag = append(err.Diag, r)
 	}

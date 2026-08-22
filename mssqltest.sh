@@ -4,7 +4,7 @@
 MSSQL_DRIVER_NAME="$1"
 MSSQL_CONTAINER_NAME="$2"
 DB_NAME="$3"
-MSSQL_SA_PASSWORD="$4"
+MSSQL_SA_PASSWORD="${ODBC_MSSQL_PASSWORD:-$4}"
 RACE="$5"
 
 pwd
@@ -34,16 +34,16 @@ rm tds.driver.template
 echo "MSSQL_DRIVER_NAME=${MSSQL_DRIVER_NAME}"
 echo "MSSQL_CONTAINER_NAME=${MSSQL_CONTAINER_NAME}"
 echo "DB_NAME=${DB_NAME}"
-echo "MSSQL_SA_PASSWORD=${MSSQL_SA_PASSWORD}"
+echo "MSSQL_SA_PASSWORD=<redacted>"
 echo "RACE=${RACE}"
 
 # add 1433 to mssrv parameter so we do not skip TestMSSQLReconnect
 
-go test -v \
+ODBC_MSSQL_PASSWORD="${MSSQL_SA_PASSWORD}" go test -v \
+	-tags=odbc_integration \
 	-msdriver="${MSSQL_DRIVER_NAME}" \
-	-mssrv=${MSSQL_CONTAINER_NAME},1433 \
-	-msdb=${DB_NAME} \
+	-mssrv="${MSSQL_CONTAINER_NAME},1433" \
+	-msdb="${DB_NAME}" \
 	-msuser=sa \
-	-mspass=${MSSQL_SA_PASSWORD} \
 	${RACE} \
 	-run=TestMSSQL

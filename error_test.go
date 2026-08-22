@@ -4,7 +4,11 @@
 
 package odbc
 
-import "testing"
+import (
+	"database/sql/driver"
+	"errors"
+	"testing"
+)
 
 func TestConnectionFailureState(t *testing.T) {
 	for _, state := range []string{"08001", "08003", "08004", "08007", "08S01"} {
@@ -16,5 +20,18 @@ func TestConnectionFailureState(t *testing.T) {
 		if isConnectionFailureState(state) {
 			t.Errorf("isConnectionFailureState(%q) = true", state)
 		}
+	}
+}
+
+func TestConnectionFailureDiagnosticDoesNotRequestRetry(t *testing.T) {
+	err := &Error{
+		APIName: "SQLExecute",
+		Diag:    []DiagRecord{{State: "08S01", Message: "connection lost"}},
+	}
+	if !err.connectionFailure() {
+		t.Fatal("connection failure diagnostic was not recognized")
+	}
+	if errors.Is(err, driver.ErrBadConn) {
+		t.Fatal("post-execution diagnostic requested an unsafe database/sql retry")
 	}
 }

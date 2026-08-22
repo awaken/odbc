@@ -116,7 +116,12 @@ func newColumn(h api.SQLHSTMT, idx int, describe columnDescriber) (Column, error
 		return NewBindableColumn(b, api.SQL_C_LONG, 4), nil
 	case api.SQL_BIGINT:
 		return NewBindableColumn(b, api.SQL_C_SBIGINT, 8), nil
-	case api.SQL_NUMERIC, api.SQL_DECIMAL, api.SQL_FLOAT, api.SQL_REAL, api.SQL_DOUBLE:
+	case api.SQL_NUMERIC, api.SQL_DECIMAL:
+		// Retrieve exact numerics through the driver's character conversion.
+		// Returning []byte is part of database/sql's driver.Value contract and
+		// avoids the precision loss caused by an intermediate float64.
+		return NewVariableWidthColumn(b, api.SQL_C_CHAR, 0)
+	case api.SQL_FLOAT, api.SQL_REAL, api.SQL_DOUBLE:
 		return NewBindableColumn(b, api.SQL_C_DOUBLE, 8), nil
 	case api.SQL_TYPE_TIMESTAMP:
 		var v api.SQL_TIMESTAMP_STRUCT
@@ -219,7 +224,7 @@ func (c *BaseColumn) Value(buf []byte) (driver.Value, error) {
 		if p == nil {
 			return buf, nil
 		}
-		s := (*[1 << 28]uint16)(p)[: len(buf)/2 : len(buf)/2]
+		s := unsafe.Slice((*uint16)(p), len(buf)/2)
 		return utf16toutf8(s), nil
 	case api.SQL_C_TYPE_TIMESTAMP:
 		t := (*api.SQL_TIMESTAMP_STRUCT)(p)

@@ -125,7 +125,7 @@ func (p *Parameter) BindValue(h api.SQLHSTMT, idx int, v driver.Value, conn *Con
 		p.Data = &d
 		buf = unsafe.Pointer(&d)
 		sqltype = api.SQL_DOUBLE
-		size = 8
+		size = 15
 	case time.Time:
 		ctype = api.SQL_C_TYPE_TIMESTAMP
 		y, m, day := d.Date()

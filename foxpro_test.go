@@ -113,7 +113,7 @@ func TestFoxPro(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if id < 0 || len(tests) < id {
+		if id < 0 || id >= len(tests) {
 			t.Errorf("unexpected row with id %d", id)
 			continue
 		}

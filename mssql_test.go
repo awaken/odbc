@@ -1,3 +1,5 @@
+//go:build odbc_integration
+
 // Copyright 2012 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
@@ -14,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"runtime"
 	"strconv"
 	"strings"
@@ -29,7 +32,7 @@ var (
 	mssrv    = flag.String("mssrv", "server", "ms sql server name")
 	msdb     = flag.String("msdb", "dbname", "ms sql server database name")
 	msuser   = flag.String("msuser", "", "ms sql server user name")
-	mspass   = flag.String("mspass", "", "ms sql server password")
+	mspass   = flag.String("mspass", os.Getenv("ODBC_MSSQL_PASSWORD"), "ms sql server password")
 	msdriver = flag.String("msdriver", defaultDriver(), "ms sql odbc driver name")
 	msport   = flag.String("msport", "1433", "ms sql server port number")
 )
@@ -62,6 +65,10 @@ func newConnParams() connParams {
 		//params["clientcharset"] = "UTF-8"
 		//params["debugflags"] = "0xffff"
 	} else {
+		// Driver 18 enables encryption by default. The disposable integration
+		// server uses its generated certificate, so retain encryption while
+		// trusting that isolated test certificate.
+		params["TrustServerCertificate"] = "yes"
 		if len(*msuser) == 0 {
 			params["trusted_connection"] = "yes"
 		} else {
@@ -116,7 +123,7 @@ func mssqlConnectWithParams(params connParams) (db *sql.DB, stmtCount int, err e
 	if err != nil {
 		return nil, 0, err
 	}
-	stats := db.Driver().(*Driver).Stats
+	stats := db.Driver().(*Driver).Stats()
 	return db, stats.StmtCount, nil
 }
 
@@ -125,11 +132,12 @@ func mssqlConnect() (db *sql.DB, stmtCount int, err error) {
 }
 
 func closeDB(t *testing.T, db *sql.DB, shouldStmtCount, ignoreIfStmtCount int) {
-	s := db.Driver().(*Driver).Stats
+	driver := db.Driver().(*Driver)
 	err := db.Close()
 	if err != nil {
 		t.Fatalf("error closing DB: %v", err)
 	}
+	s := driver.Stats()
 	switch s.StmtCount {
 	case shouldStmtCount:
 		// all good
@@ -241,7 +249,7 @@ func exec(t *testing.T, db *sql.DB, query string) {
 }
 
 func driverExec(t *testing.T, dc driver.Conn, query string) {
-	st, err := dc.Prepare(query)
+	st, err := dc.(driver.ConnPrepareContext).PrepareContext(context.Background(), query)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -251,7 +259,7 @@ func driverExec(t *testing.T, dc driver.Conn, query string) {
 		}
 	}()
 
-	r, err := st.Exec([]driver.Value{})
+	r, err := st.(driver.StmtExecContext).ExecContext(context.Background(), nil)
 	if err != nil {
 		if t != nil {
 			t.Fatal(err)
@@ -265,6 +273,10 @@ func driverExec(t *testing.T, dc driver.Conn, query string) {
 		}
 		return
 	}
+}
+
+func driverBegin(dc driver.Conn) (driver.Tx, error) {
+	return dc.(driver.ConnBeginTx).BeginTx(context.Background(), driver.TxOptions{})
 }
 
 func TestMSSQLCreateInsertDelete(t *testing.T) {
@@ -289,7 +301,7 @@ func TestMSSQLCreateInsertDelete(t *testing.T) {
 			weight:    15.5,
 			dob:       time.Date(2000, 5, 10, 11, 1, 1, 0, time.Local),
 			data:      []byte{0x0, 0x0, 0xb, 0xad, 0xc0, 0xde},
-			canBeNull: sql.NullString{"aa", true},
+			canBeNull: sql.NullString{String: "aa", Valid: true},
 		},
 		"gopher": {
 			age:       3,
@@ -297,7 +309,7 @@ func TestMSSQLCreateInsertDelete(t *testing.T) {
 			weight:    26.12,
 			dob:       time.Date(2009, 5, 10, 11, 1, 1, 123e6, time.Local),
 			data:      []byte{0x0},
-			canBeNull: sql.NullString{"bbb", true},
+			canBeNull: sql.NullString{String: "bbb", Valid: true},
 		},
 	}
 
@@ -426,20 +438,24 @@ func TestMSSQLTransactions(t *testing.T) {
 	if was+1 != is {
 		t.Fatalf("is(%d) should be 1 more then was(%d)", is, was)
 	}
-	ch := make(chan error)
+	ch := make(chan error, 1)
 	go func() {
 		// this will block until our transaction is finished
-		err = db.QueryRow("select count(*) from dbo.temp").Scan(&is)
-		if err != nil {
+		var count int
+		if err := db.QueryRow("select count(*) from dbo.temp").Scan(&count); err != nil {
 			ch <- err
+			return
 		}
-		if was+1 != is {
-			ch <- fmt.Errorf("is(%d) should be 1 more then was(%d)", is, was)
+		if was+1 != count {
+			ch <- fmt.Errorf("is(%d) should be 1 more then was(%d)", count, was)
+			return
 		}
 		ch <- nil
 	}()
 	time.Sleep(100 * time.Millisecond)
-	tx.Commit()
+	if err = tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
 	err = <-ch
 	if err != nil {
 		t.Fatal(err)
@@ -468,7 +484,9 @@ func TestMSSQLTransactions(t *testing.T) {
 	if was+1 != is {
 		t.Fatalf("is(%d) should be 1 more then was(%d)", is, was)
 	}
-	tx.Rollback()
+	if err = tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
 	err = db.QueryRow("select count(*) from dbo.temp").Scan(&is)
 	if err != nil {
 		t.Fatal(err)
@@ -587,13 +605,15 @@ var typeTests = []typeTest{
 	{"select cast(9223372036854775807 as bigint)", match(int64(9223372036854775807))},
 
 	// decimal, float, real
-	{"select cast(123 as decimal(5, 0))", match(float64(123))},
-	{"select cast(-123 as decimal(5, 0))", match(float64(-123))},
-	{"select cast(123.5 as decimal(5, 0))", match(float64(124))},
+	{"select cast(123 as decimal(5, 0))", match([]byte("123"))},
+	{"select cast(-123 as decimal(5, 0))", match([]byte("-123"))},
+	{"select cast(123.5 as decimal(5, 0))", match([]byte("124"))},
 	{"select cast(NULL as decimal(5, 0))", match(nil)},
-	{"select cast(123.45 as decimal(5, 2))", match(123.45)},
-	{"select cast(-123.45 as decimal(5, 2))", match(-123.45)},
-	{"select cast(123.456 as decimal(5, 2))", match(123.46)},
+	{"select cast(123.45 as decimal(5, 2))", match([]byte("123.45"))},
+	{"select cast(-123.45 as decimal(5, 2))", match([]byte("-123.45"))},
+	{"select cast(123.456 as decimal(5, 2))", match([]byte("123.46"))},
+	{"select cast(12345678901234567890123456789012345678 as decimal(38, 0))", match([]byte("12345678901234567890123456789012345678"))},
+	{"select cast(-12345678901234567890.123456789012345678 as decimal(38, 18))", match([]byte("-12345678901234567890.123456789012345678"))},
 	{"select cast(0.123456789 as float)", match(0.123456789)},
 	{"select cast(NULL as float)", match(nil)},
 	{"select cast(3.6666667461395264 as real)", match(3.6666667461395264)},
@@ -872,8 +892,9 @@ func TestMSSQLStmtAndRows(t *testing.T) {
 		}
 	}()
 
-	if db.Driver().(*Driver).Stats.StmtCount != sc {
-		t.Fatalf("invalid statement count: expected %v, is %v", sc, db.Driver().(*Driver).Stats.StmtCount)
+	stmtCount := db.Driver().(*Driver).Stats().StmtCount
+	if stmtCount != sc {
+		t.Fatalf("invalid statement count: expected %v, is %v", sc, stmtCount)
 	}
 
 	// no resource tracking past this point
@@ -1443,8 +1464,8 @@ type tcpProxy struct {
 }
 
 func (p *tcpProxy) run(ln net.Listener, remote string) {
+	defer p.pause()
 	for {
-		defer p.pause()
 		c1, err := ln.Accept()
 		if err != nil {
 			return
@@ -1452,18 +1473,18 @@ func (p *tcpProxy) run(ln net.Listener, remote string) {
 		go func(c1 net.Conn) {
 			defer c1.Close()
 
-			if p.paused() {
+			if !p.addConn(c1) {
 				return
 			}
-
-			p.addConn(c1)
 
 			c2, err := net.Dial("tcp", remote)
 			if err != nil {
 				panic(err)
 			}
-			p.addConn(c2)
 			defer c2.Close()
+			if !p.addConn(c2) {
+				return
+			}
 
 			go func() {
 				io.Copy(c2, c1)
@@ -1483,16 +1504,15 @@ func (p *tcpProxy) pause() {
 	p.conns = p.conns[:0]
 }
 
-func (p *tcpProxy) paused() bool {
+func (p *tcpProxy) addConn(c net.Conn) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.stopped
-}
-
-func (p *tcpProxy) addConn(c net.Conn) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	if p.stopped {
+		c.Close()
+		return false
+	}
 	p.conns = append(p.conns, c)
+	return true
 }
 
 func (p *tcpProxy) restart() {
@@ -1592,12 +1612,14 @@ func TestMSSQLMarkTxBadConn(t *testing.T) {
 	testFn := func(endTx func(driver.Tx) error, nextFn func(driver.Conn) error) {
 		proxy.restart()
 
-		cc, sc := drv.Stats.ConnCount, drv.Stats.StmtCount
+		before := drv.Stats()
+		cc, sc := before.ConnCount, before.StmtCount
 		defer func() {
-			if should, is := sc, drv.Stats.StmtCount; should != is {
+			after := drv.Stats()
+			if should, is := sc, after.StmtCount; should != is {
 				t.Errorf("leaked statement, should=%d, is=%d", should, is)
 			}
-			if should, is := cc, drv.Stats.ConnCount; should != is {
+			if should, is := cc, after.ConnCount; should != is {
 				t.Errorf("leaked connection, should=%d, is=%d", should, is)
 			}
 		}()
@@ -1615,7 +1637,7 @@ func TestMSSQLMarkTxBadConn(t *testing.T) {
 		driverExec(nil, dc, "drop table dbo.temp")
 		driverExec(t, dc, `create table dbo.temp (name varchar(50))`)
 
-		tx, err := dc.Begin()
+		tx, err := driverBegin(dc)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1638,7 +1660,7 @@ func TestMSSQLMarkTxBadConn(t *testing.T) {
 	}
 
 	beginFn := func(dc driver.Conn) error {
-		tx, err := dc.Begin()
+		tx, err := driverBegin(dc)
 		if err != nil {
 			return err
 		}
@@ -1673,12 +1695,14 @@ func TestMSSQLMarkBeginBadConn(t *testing.T) {
 	params := newConnParams()
 
 	testFn := func(label string, nextFn func(driver.Conn) error) {
-		cc, sc := drv.Stats.ConnCount, drv.Stats.StmtCount
+		before := drv.Stats()
+		cc, sc := before.ConnCount, before.StmtCount
 		defer func() {
-			if should, is := sc, drv.Stats.StmtCount; should != is {
+			after := drv.Stats()
+			if should, is := sc, after.StmtCount; should != is {
 				t.Errorf("leaked statement, should=%d, is=%d", should, is)
 			}
-			if should, is := cc, drv.Stats.ConnCount; should != is {
+			if should, is := cc, after.ConnCount; should != is {
 				t.Errorf("leaked connection, should=%d, is=%d", should, is)
 			}
 		}()
@@ -1701,7 +1725,7 @@ func TestMSSQLMarkBeginBadConn(t *testing.T) {
 			testBeginErr = errors.New("cannot start tx")
 			defer func() { testBeginErr = nil }()
 
-			if _, err := dc.Begin(); err == nil {
+			if _, err := driverBegin(dc); err == nil {
 				t.Fatal("unexpected success, expected error")
 			}
 		}()
@@ -1716,7 +1740,7 @@ func TestMSSQLMarkBeginBadConn(t *testing.T) {
 	}
 
 	beginFn := func(dc driver.Conn) error {
-		tx, err := dc.Begin()
+		tx, err := driverBegin(dc)
 		if err != nil {
 			return err
 		}
@@ -1936,29 +1960,96 @@ func TestMSSQLQueryContextTimeout(t *testing.T) {
 	}
 	defer closeDB(t, db, sc, sc)
 
-	contextTimeout := time.Millisecond * 500
-	queryWaitFor := time.Second * 1
+	assertMSSQLContextTimeout(t, func(ctx context.Context) error {
+		rows, err := db.QueryContext(ctx, "WAITFOR DELAY '00:01'; SELECT 1;")
+		if rows != nil {
+			_ = rows.Close()
+		}
+		return err
+	})
+}
 
+func TestMSSQLExecContextTimeout(t *testing.T) {
+	db, sc, err := mssqlConnect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeDB(t, db, sc, sc)
+
+	assertMSSQLContextTimeout(t, func(ctx context.Context) error {
+		_, err := db.ExecContext(ctx, "WAITFOR DELAY '00:01';")
+		return err
+	})
+}
+
+func TestMSSQLPreparedContextTimeout(t *testing.T) {
+	db, sc, err := mssqlConnect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeDB(t, db, sc, sc)
+
+	tests := []struct {
+		name      string
+		query     string
+		operation func(context.Context, *sql.Stmt) error
+	}{
+		{
+			name:  "exec",
+			query: "WAITFOR DELAY '00:01';",
+			operation: func(ctx context.Context, statement *sql.Stmt) error {
+				_, err := statement.ExecContext(ctx)
+				return err
+			},
+		},
+		{
+			name:  "query",
+			query: "WAITFOR DELAY '00:01'; SELECT 1;",
+			operation: func(ctx context.Context, statement *sql.Stmt) error {
+				rows, err := statement.QueryContext(ctx)
+				if rows != nil {
+					_ = rows.Close()
+				}
+				return err
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			statement, err := db.PrepareContext(context.Background(), test.query)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer statement.Close()
+			assertMSSQLContextTimeout(t, func(ctx context.Context) error {
+				return test.operation(ctx, statement)
+			})
+		})
+	}
+}
+
+func assertMSSQLContextTimeout(t *testing.T, operation func(context.Context) error) {
+	t.Helper()
+	contextTimeout := 500 * time.Millisecond
+	maximumDuration := 2 * time.Second
 	ctx, cancel := context.WithTimeout(context.Background(), contextTimeout)
 	defer cancel()
 
 	start := time.Now()
-	_, err = db.QueryContext(ctx, "WAITFOR DELAY '00:01';")
+	err := operation(ctx)
 	elapsed := time.Since(start)
 
-	if err == nil {
-		t.Fatal("Unexpected success, expected error")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("operation error = %v; want %v", err, context.DeadlineExceeded)
 	}
-	if err != context.DeadlineExceeded {
-		t.Fatalf("Unexpected error value: should=%s, is=%s", context.DeadlineExceeded, err)
-	}
-	if elapsed > queryWaitFor {
-		t.Fatalf("Unexpected query duration: should=>%s, is=%s", queryWaitFor, elapsed)
+	if elapsed > maximumDuration {
+		t.Fatalf("operation duration = %s; want at most %s", elapsed, maximumDuration)
 	}
 	if elapsed < contextTimeout {
-		t.Fatalf("Query did not delay: should=<%s, is=%s", contextTimeout, elapsed)
+		t.Fatalf("operation duration = %s; want at least %s", elapsed, contextTimeout)
 	}
 }
+
 func TestMSSQLQueryContextCancel(t *testing.T) {
 	db, sc, err := mssqlConnect()
 	if err != nil {

@@ -31,7 +31,7 @@ func ToHandleAndType(handle interface{}) (h api.SQLHANDLE, ht api.SQLSMALLINT, e
 	return h, ht, err
 }
 
-func releaseHandle(handle interface{}) error {
+func releaseHandle(handle interface{}, stats *handleStats) error {
 	h, ht, err := ToHandleAndType(handle)
 	if err != nil {
 		return err
@@ -48,5 +48,8 @@ func releaseHandle(handle interface{}) error {
 	if IsError(ret) {
 		return NewError("SQLFreeHandle", handle)
 	}
-	return drv.Stats.updateHandleCount(ht, -1)
+	if stats == nil {
+		return nil
+	}
+	return stats.updateHandleCount(ht, -1)
 }

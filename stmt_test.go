@@ -5,6 +5,7 @@
 package odbc
 
 import (
+	"context"
 	"database/sql/driver"
 	"errors"
 	"testing"
@@ -19,5 +20,23 @@ func TestStmtRejectsBadConnection(t *testing.T) {
 	}
 	if _, err := statement.Query(nil); !errors.Is(err, driver.ErrBadConn) {
 		t.Fatalf("Query error = %v; want %v", err, driver.ErrBadConn)
+	}
+	if _, err := statement.ExecContext(context.Background(), nil); !errors.Is(err, driver.ErrBadConn) {
+		t.Fatalf("ExecContext error = %v; want %v", err, driver.ErrBadConn)
+	}
+	if _, err := statement.QueryContext(context.Background(), nil); !errors.Is(err, driver.ErrBadConn) {
+		t.Fatalf("QueryContext error = %v; want %v", err, driver.ErrBadConn)
+	}
+}
+
+func TestStmtContextMethodsStopBeforeNativeCall(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	statement := new(Stmt)
+	if _, err := statement.ExecContext(ctx, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("ExecContext error = %v; want %v", err, context.Canceled)
+	}
+	if _, err := statement.QueryContext(ctx, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("QueryContext error = %v; want %v", err, context.Canceled)
 	}
 }
