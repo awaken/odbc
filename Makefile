@@ -1,5 +1,9 @@
 
 DB_NAME=test
+ODBC_READY_TIMEOUT?=120
+ODBC_COMMAND_TIMEOUT?=10
+ODBC_DIR:=$(dir $(abspath $(lastword $(MAKEFILE_LIST))))
+export DB_NAME ODBC_READY_TIMEOUT ODBC_COMMAND_TIMEOUT
 PASSWORD=Passw0rd
 
 help:
@@ -27,17 +31,7 @@ start-mssql:
 		-p 1433:1433 \
 		--network=${MSSQL_NETWORK} \
 		$(MSSQL_IMAGE)
-	echo -n "starting $(MSSQL_CONTAINER_NAME) "; \
-		while ! \
-			docker logs $(MSSQL_CONTAINER_NAME) 2>&1 | \
-			grep SQL.Server.is.now.ready.for.client.connections >/dev/null ; \
-		do echo -n .; sleep 2; done; echo " done"
-	echo -n "creating database $(DB_NAME) "; \
-		while ! \
-			docker exec $(MSSQL_CONTAINER_NAME) sh -c \
-				'SQLCMDPASSWORD="$$MSSQL_SA_PASSWORD" /opt/mssql-tools18/bin/sqlcmd -S localhost -U SA -Q "create database $(DB_NAME)"' \
-				>/dev/null 2>&1 ; \
-		do echo -n .; sleep 2; done; echo " done"
+	@bash "$(ODBC_DIR)waitdb.sh" mssql "$(MSSQL_CONTAINER_NAME)"
 
 build-unixodbc:
 	docker build \
@@ -100,8 +94,7 @@ export ODBC_MYSQL_PASSWORD
 
 start-mysql:
 	docker run --name=$(MYSQL_CONTAINER_NAME) -e MYSQL_ROOT_PASSWORD -d -p 127.0.0.1:3306:3306 $(MYSQL_IMAGE)
-	echo -n "starting $(MYSQL_CONTAINER_NAME) "; while ! docker logs $(MYSQL_CONTAINER_NAME) 2>&1 | grep ^Version.*port:.3306 >/dev/null ; do echo -n .; sleep 1; done; echo " done"
-	docker exec $(MYSQL_CONTAINER_NAME) sh -c 'echo "create database $(DB_NAME)" | MYSQL_PWD="$$MYSQL_ROOT_PASSWORD" mysql -hlocalhost -uroot'
+	@bash "$(ODBC_DIR)waitdb.sh" mysql "$(MYSQL_CONTAINER_NAME)"
 
 test-mysql:
 	go test -tags=odbc_integration -v -mydb=$(DB_NAME) -mysrv=127.0.0.1 -myuser=root -run=MYSQL

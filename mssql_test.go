@@ -18,6 +18,7 @@ import (
 	"maps"
 	"net"
 	"os"
+	osexec "os/exec"
 	"runtime"
 	"slices"
 	"strconv"
@@ -1473,68 +1474,193 @@ func TestMSSQLSingleCharParam(t *testing.T) {
 	exec(t, db, "drop table dbo.temp")
 }
 
+// tcpProxy owns one listener. Each pause joins the current connection group;
+// restart admits a fresh group without carrying canceled dials forward.
 type tcpProxy struct {
-	mu      sync.Mutex
-	stopped bool
-	conns   []net.Conn
+	mu        sync.Mutex
+	lifecycle sync.Mutex
+	stopped   bool
+	closed    bool
+	ln        net.Listener
+	group     *tcpProxyGroup
+	err       error
+	dial      func(context.Context, string, string) (net.Conn, error)
 }
 
-func (p *tcpProxy) run(ln net.Listener, remote string) {
-	defer p.pause()
-	for {
-		c1, err := ln.Accept()
-		if err != nil {
-			return
-		}
-		go func(c1 net.Conn) {
-			defer c1.Close()
+type tcpProxyGroup struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	active sync.WaitGroup
+	conns  map[net.Conn]struct{}
+}
 
-			if !p.addConn(c1) {
-				return
-			}
+func newTCPProxyGroup() *tcpProxyGroup {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &tcpProxyGroup{ctx: ctx, cancel: cancel, conns: make(map[net.Conn]struct{})}
+}
 
-			c2, err := net.Dial("tcp", remote)
-			if err != nil {
-				panic(err)
-			}
-			defer c2.Close()
-			if !p.addConn(c2) {
-				return
-			}
-
-			go func() {
-				io.Copy(c2, c1)
-			}()
-			io.Copy(c1, c2)
-		}(c1)
+// run returns the first unexpected error after every owned connection has joined.
+func (p *tcpProxy) run(ln net.Listener, remote string) error {
+	defer ln.Close()
+	p.mu.Lock()
+	if p.ln != nil {
+		p.mu.Unlock()
+		return errors.New("proxy listener already started")
 	}
+	p.ln = ln
+	if !p.stopped && p.group == nil {
+		p.group = newTCPProxyGroup()
+	}
+	p.mu.Unlock()
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			p.mu.Lock()
+			if p.err == nil && !errors.Is(err, net.ErrClosed) {
+				p.err = err
+			}
+			p.closed = true
+			p.mu.Unlock()
+			break
+		}
+		p.mu.Lock()
+		g := p.group
+		if p.stopped || p.closed || g == nil {
+			p.mu.Unlock()
+			_ = conn.Close()
+			continue
+		}
+		g.active.Add(1)
+		g.conns[conn] = struct{}{}
+		p.mu.Unlock()
+		go p.copy(g, conn, remote)
+	}
+	p.pause()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.err
+}
+
+func (p *tcpProxy) copy(g *tcpProxyGroup, client net.Conn, remote string) {
+	defer g.active.Done()
+	defer p.release(g, client)
+	dial := p.dial
+	if dial == nil {
+		dial = (&net.Dialer{Timeout: 5 * time.Second}).DialContext
+	}
+	upstream, err := dial(g.ctx, "tcp", remote)
+	if err != nil {
+		p.fail(g, fmt.Errorf("proxy dial: %w", err))
+		return
+	}
+	defer p.release(g, upstream)
+	p.mu.Lock()
+	if p.group != g || p.stopped || p.closed {
+		p.mu.Unlock()
+		return
+	}
+	g.conns[upstream] = struct{}{}
+	p.mu.Unlock()
+
+	// Forward half-closes so a peer can finish its response, then join both copies.
+	done := make(chan error, 2)
+	go func() { done <- tcpProxyCopy(upstream, client) }()
+	go func() { done <- tcpProxyCopy(client, upstream) }()
+	first := <-done
+	if first != nil {
+		_ = client.Close()
+		_ = upstream.Close()
+	}
+	second := <-done
+	for _, err := range []error{first, second} {
+		if err != nil && !errors.Is(err, net.ErrClosed) {
+			p.fail(g, fmt.Errorf("proxy copy: %w", err))
+		}
+	}
+}
+
+func tcpProxyCopy(dst, src net.Conn) error {
+	if _, err := io.Copy(dst, src); err != nil {
+		return err
+	}
+	if half, ok := dst.(interface{ CloseWrite() error }); ok {
+		return half.CloseWrite()
+	}
+	return dst.Close()
+}
+
+func (p *tcpProxy) release(g *tcpProxyGroup, c net.Conn) {
+	_ = c.Close()
+	p.mu.Lock()
+	delete(g.conns, c)
+	p.mu.Unlock()
+}
+
+func (p *tcpProxy) fail(g *tcpProxyGroup, err error) {
+	p.mu.Lock()
+	if p.group != g || p.stopped || p.closed {
+		p.mu.Unlock()
+		return
+	}
+	if p.err == nil {
+		p.err = err
+	}
+	p.closed = true
+	ln := p.ln
+	p.mu.Unlock()
+	_ = ln.Close()
 }
 
 func (p *tcpProxy) pause() {
+	p.lifecycle.Lock()
+	defer p.lifecycle.Unlock()
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.stopped = true
-	for _, c := range p.conns {
-		c.Close()
+	g := p.group
+	p.group = nil
+	var conns []net.Conn
+	if g != nil {
+		for c := range g.conns {
+			conns = append(conns, c)
+		}
 	}
-	p.conns = p.conns[:0]
-}
-
-func (p *tcpProxy) addConn(c net.Conn) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.stopped {
-		c.Close()
-		return false
+	p.mu.Unlock()
+	if g != nil {
+		g.cancel()
+		for _, c := range conns {
+			_ = c.Close()
+		}
+		g.active.Wait()
 	}
-	p.conns = append(p.conns, c)
-	return true
 }
 
 func (p *tcpProxy) restart() {
+	p.lifecycle.Lock()
+	defer p.lifecycle.Unlock()
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.closed || !p.stopped {
+		return
+	}
+	p.group = newTCPProxyGroup()
 	p.stopped = false
+}
+
+func startMSSQLProxy(t *testing.T, p *tcpProxy, ln net.Listener, remote string) {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- p.run(ln, remote) }()
+	t.Cleanup(func() {
+		_ = ln.Close()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("proxy stopped: %v", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Error("proxy shutdown did not join")
+		}
+	})
 }
 
 func TestMSSQLReconnect(t *testing.T) {
@@ -1556,7 +1682,7 @@ func TestMSSQLReconnect(t *testing.T) {
 	}
 
 	proxy := new(tcpProxy)
-	go proxy.run(ln, address)
+	startMSSQLProxy(t, proxy, ln, address)
 
 	db, sc, err := mssqlConnectWithParams(params)
 	if err != nil {
@@ -1623,7 +1749,7 @@ func TestMSSQLMarkTxBadConn(t *testing.T) {
 	}
 
 	proxy := new(tcpProxy)
-	go proxy.run(ln, address)
+	startMSSQLProxy(t, proxy, ln, address)
 
 	testFn := func(endTx func(driver.Tx) error, nextFn func(driver.Conn) error) {
 		proxy.restart()
@@ -2116,4 +2242,234 @@ func TestODBCSyntheticAttributeBoundaries(t *testing.T) {
 	if got := (connParams{"server": "local"}).makeODBCConnectionString(); got != "server={local};" {
 		t.Fatalf("server without port = %q", got)
 	}
+}
+
+func TestMSSQLProxyDialFailure(t *testing.T) {
+	const childEnv = "ODBC_TEST_PROXY_REFUSAL"
+	if os.Getenv(childEnv) != "1" {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		cmd := osexec.CommandContext(ctx, os.Args[0], "-test.run=^TestMSSQLProxyDialFailure$", "-test.timeout=5s")
+		cmd.Env = append(os.Environ(), childEnv+"=1", "ODBC_MSSQL_PASSWORD=")
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("proxy failure escaped its owner: %v\n%s", err, output)
+		}
+		return
+	}
+
+	// Closing our own loopback endpoint produces a harmless connection refusal.
+	remote, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := remote.Addr().String()
+	if err := remote.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	p := new(tcpProxy)
+	done := make(chan error, 1)
+	go func() { done <- p.run(ln, address) }()
+	client, err := net.DialTimeout("tcp", ln.Addr().String(), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if err := client.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var b [1]byte
+	if _, err := client.Read(b[:]); err == nil {
+		t.Fatal("refused endpoint unexpectedly sent data")
+	}
+	select {
+	case err := <-done:
+		if _, ok := errors.AsType[*net.OpError](err); !ok {
+			t.Fatalf("owner did not receive dial error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("proxy did not stop and join after dial failure")
+	}
+}
+
+func TestMSSQLProxyPauseRestart(t *testing.T) {
+	remote := mssqlProxyEcho(t)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := new(tcpProxy)
+	startMSSQLProxy(t, p, ln, remote.Addr().String())
+	for i := range 3 {
+		client := mssqlProxyClient(t, ln.Addr().String())
+		mssqlProxyExchange(t, client, fmt.Sprintf("run %d", i))
+		p.pause()
+		var b [1]byte
+		if _, err := client.Read(b[:]); err == nil {
+			t.Fatal("paused proxy kept a connection alive")
+		}
+		_ = client.Close()
+		paused := mssqlProxyClient(t, ln.Addr().String())
+		if _, err := paused.Read(b[:]); err == nil {
+			t.Fatal("paused proxy admitted new work")
+		}
+		_ = paused.Close()
+		p.restart()
+	}
+	last := mssqlProxyClient(t, ln.Addr().String())
+	mssqlProxyExchange(t, last, "after repeated restart")
+	_ = last.Close()
+}
+
+func TestMSSQLProxyPauseCancelsDial(t *testing.T) {
+	remote := mssqlProxyEcho(t)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	var attempts atomic.Int32
+	p := &tcpProxy{dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+		if attempts.Add(1) == 1 {
+			close(entered)
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+		return (&net.Dialer{Timeout: time.Second}).DialContext(ctx, network, address)
+	}}
+	startMSSQLProxy(t, p, ln, remote.Addr().String())
+	first := mssqlProxyClient(t, ln.Addr().String())
+	defer first.Close()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("dial did not start")
+	}
+	paused := make(chan struct{})
+	go func() { p.pause(); close(paused) }()
+	select {
+	case <-paused:
+	case <-time.After(time.Second):
+		t.Fatal("pause did not cancel and join its dial")
+	}
+	p.restart()
+	next := mssqlProxyClient(t, ln.Addr().String())
+	defer next.Close()
+	mssqlProxyExchange(t, next, "fresh dial context")
+}
+
+func TestMSSQLProxyHalfClose(t *testing.T) {
+	remote, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer remote.Close()
+	server := make(chan error, 1)
+	go func() {
+		c, err := remote.Accept()
+		if err != nil {
+			server <- err
+			return
+		}
+		defer c.Close()
+		_ = c.SetDeadline(time.Now().Add(2 * time.Second))
+		data, err := io.ReadAll(c)
+		if err == nil {
+			_, err = c.Write(append([]byte("reply:"), data...))
+		}
+		server <- err
+	}()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	startMSSQLProxy(t, new(tcpProxy), ln, remote.Addr().String())
+	client := mssqlProxyClient(t, ln.Addr().String())
+	defer client.Close()
+	if _, err := io.WriteString(client, "request"); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.(*net.TCPConn).CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := io.ReadAll(client)
+	if err != nil || string(data) != "reply:request" {
+		t.Errorf("half-close response = %q, %v", data, err)
+	}
+	select {
+	case err := <-server:
+		if err != nil {
+			t.Errorf("loopback server: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Error("loopback server did not finish")
+	}
+}
+
+func mssqlProxyClient(t *testing.T, address string) net.Conn {
+	t.Helper()
+	c, err := net.DialTimeout("tcp", address, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		_ = c.Close()
+		t.Fatal(err)
+	}
+	return c
+}
+
+func mssqlProxyExchange(t *testing.T, c net.Conn, value string) {
+	t.Helper()
+	if _, err := io.WriteString(c, value); err != nil {
+		t.Fatal(err)
+	}
+	data := make([]byte, len(value))
+	if _, err := io.ReadFull(c, data); err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != value {
+		t.Fatalf("relayed data = %q; want %q", data, value)
+	}
+}
+
+func mssqlProxyEcho(t *testing.T) net.Listener {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var active sync.WaitGroup
+	var mu sync.Mutex
+	var conns []net.Conn
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			conns = append(conns, c)
+			mu.Unlock()
+			active.Add(1)
+			go func() { defer active.Done(); defer c.Close(); _, _ = io.Copy(c, c) }()
+		}
+	}()
+	t.Cleanup(func() {
+		_ = ln.Close()
+		<-done
+		mu.Lock()
+		for _, c := range conns {
+			_ = c.Close()
+		}
+		mu.Unlock()
+		active.Wait()
+	})
+	return ln
 }
