@@ -228,6 +228,12 @@ func (c *BaseColumn) Value(buf []byte) (driver.Value, error) {
 		return utf16toutf8(s), nil
 	case api.SQL_C_TYPE_TIMESTAMP:
 		t := (*api.SQL_TIMESTAMP_STRUCT)(p)
+		if err := validateODBCDate(int(t.Year), int(t.Month), int(t.Day)); err != nil {
+			return nil, fmt.Errorf("invalid timestamp column: %w", err)
+		}
+		if err := validateODBCTime(int(t.Hour), int(t.Minute), int(t.Second), uint32(t.Fraction)); err != nil {
+			return nil, fmt.Errorf("invalid timestamp column: %w", err)
+		}
 		r := time.Date(int(t.Year), time.Month(t.Month), int(t.Day),
 			int(t.Hour), int(t.Minute), int(t.Second), int(t.Fraction),
 			time.Local)
@@ -246,17 +252,26 @@ func (c *BaseColumn) Value(buf []byte) (driver.Value, error) {
 		return r, nil
 	case api.SQL_C_DATE:
 		t := (*api.SQL_DATE_STRUCT)(p)
+		if err := validateODBCDate(int(t.Year), int(t.Month), int(t.Day)); err != nil {
+			return nil, fmt.Errorf("invalid date column: %w", err)
+		}
 		r := time.Date(int(t.Year), time.Month(t.Month), int(t.Day),
 			0, 0, 0, 0, time.Local)
 		return r, nil
 	case api.SQL_C_TIME:
 		t := (*api.SQL_TIME_STRUCT)(p)
+		if err := validateODBCTime(int(t.Hour), int(t.Minute), int(t.Second), 0); err != nil {
+			return nil, fmt.Errorf("invalid time column: %w", err)
+		}
 		r := time.Date(1, time.January, 1,
 			int(t.Hour), int(t.Minute), int(t.Second), 0, time.Local)
 		return r, nil
 	case api.SQL_C_BINARY:
 		if c.SQLType == api.SQL_SS_TIME2 {
 			t := (*api.SQL_SS_TIME2_STRUCT)(p)
+			if err := validateODBCTime(int(t.Hour), int(t.Minute), int(t.Second), uint32(t.Fraction)); err != nil {
+				return nil, fmt.Errorf("invalid time2 column: %w", err)
+			}
 			r := time.Date(1, time.January, 1,
 				int(t.Hour), int(t.Minute), int(t.Second), int(t.Fraction),
 				time.Local)
@@ -265,6 +280,29 @@ func (c *BaseColumn) Value(buf []byte) (driver.Value, error) {
 		return buf, nil
 	}
 	return nil, fmt.Errorf("unsupported column ctype %d", c.CType)
+}
+
+func validateODBCDate(year, month, day int) error {
+	if month < 1 || month > 12 || day < 1 {
+		return fmt.Errorf("date fields %d-%d-%d are outside the Gregorian range", year, month, day)
+	}
+	y, m, d := time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.UTC).Date()
+	if y != year || int(m) != month || d != day {
+		return fmt.Errorf("date fields %d-%d-%d are outside the Gregorian range", year, month, day)
+	}
+	return nil
+}
+
+// Go time values cannot preserve leap seconds; reject them before time.Date
+// normalizes the value into a different minute or day.
+func validateODBCTime(hour, minute, second int, fraction uint32) error {
+	if second > 59 {
+		return fmt.Errorf("ODBC second %d is not representable as time.Time", second)
+	}
+	if hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || fraction >= 1_000_000_000 {
+		return fmt.Errorf("time fields %d:%d:%d.%09d are outside the ODBC range", hour, minute, second, fraction)
+	}
+	return nil
 }
 
 // BindableColumn allows access to columns that can have their buffers
@@ -394,7 +432,7 @@ func (c *NonBindableColumn) unpin() {
 
 func (c *NonBindableColumn) Value(h api.SQLHSTMT, idx int) (driver.Value, error) {
 	var l BufferLen
-	var total []byte
+	total := make([]byte, 0)
 	b := make([]byte, 1024)
 loop:
 	for {

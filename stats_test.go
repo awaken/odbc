@@ -68,3 +68,28 @@ func TestDriverStatsSnapshotConcurrent(t *testing.T) {
 		t.Fatalf("StmtCount = %d; want 0", got)
 	}
 }
+
+func TestDriverPoolModeConcurrent(t *testing.T) {
+	driver := new(Driver)
+	var waitGroup sync.WaitGroup
+	for i := range 32 {
+		mode := DriverPoolMode(i % 3)
+		waitGroup.Add(2)
+		go func() {
+			defer waitGroup.Done()
+			driver.setPoolMode(mode)
+		}()
+		go func() {
+			defer waitGroup.Done()
+			_ = driver.PoolMode()
+			_ = driver.IsPooling()
+			_ = driver.IsFullPooling()
+		}()
+	}
+	waitGroup.Wait()
+
+	driver.setPoolMode(DriverPoolModeFull)
+	if driver.PoolMode() != DriverPoolModeFull || !driver.IsPooling() || !driver.IsFullPooling() {
+		t.Fatal("full pooling mode was not retained")
+	}
+}

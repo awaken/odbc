@@ -28,11 +28,76 @@ var _ driver.ExecerContext = (*Conn)(nil)
 var _ driver.QueryerContext = (*Conn)(nil)
 var _ driver.Validator = (*Conn)(nil)
 
-var accessDriverSubstr = strings.ToUpper(strings.Replace("DRIVER={Microsoft Access Driver", " ", "", -1))
+var errODBCAttributes = errors.New("malformed ODBC connection string attributes")
 
+// odbcAccessDriver reads only DRIVER, honoring braced values and escaped closing
+// braces. Equal case-insensitive duplicates are accepted; conflicting values are
+// rejected before connecting. Named DSNs alone do not identify an Access driver.
+func odbcAccessDriver(dsn string) (bool, error) {
+	var driverName string
+	seen := false
+	for {
+		dsn = strings.TrimLeft(dsn, " \t\r\n;")
+		if dsn == "" {
+			break
+		}
+		key, rest, ok := strings.Cut(dsn, "=")
+		key = strings.TrimSpace(key)
+		if !ok || key == "" || strings.Contains(key, ";") {
+			return false, errODBCAttributes
+		}
+		rest = strings.TrimLeft(rest, " \t\r\n")
+		var value string
+		if strings.HasPrefix(rest, "{") {
+			var b strings.Builder
+			i, closed := 1, false
+			for i < len(rest) {
+				if rest[i] == '}' {
+					if i+1 < len(rest) && rest[i+1] == '}' {
+						b.WriteByte('}')
+						i += 2
+						continue
+					}
+					i++
+					closed = true
+					break
+				}
+				b.WriteByte(rest[i])
+				i++
+			}
+			if !closed {
+				return false, errODBCAttributes
+			}
+			value = b.String()
+			dsn = strings.TrimLeft(rest[i:], " \t\r\n")
+			if dsn != "" && dsn[0] != ';' {
+				return false, errODBCAttributes
+			}
+		} else {
+			value, dsn, _ = strings.Cut(rest, ";")
+		}
+		if strings.EqualFold(key, "DRIVER") {
+			value = strings.TrimSpace(value)
+			if seen && !strings.EqualFold(driverName, value) {
+				return false, errors.New("conflicting ODBC DRIVER attributes")
+			}
+			driverName, seen = value, true
+		}
+	}
+	return strings.EqualFold(driverName, "Microsoft Access Driver (*.mdb)") ||
+		strings.EqualFold(driverName, "Microsoft Access Driver (*.mdb, *.accdb)"), nil
+}
+
+// Open connects using dsn. DRIVER names alone select Access parameter handling;
+// conflicting duplicate DRIVER attributes and malformed attribute syntax fail
+// before a connection is opened. Attribute validation errors omit dsn values.
 func (d *Driver) Open(dsn string) (driver.Conn, error) {
 	if strings.IndexByte(dsn, 0) >= 0 {
 		return nil, errors.New("ODBC connection string contains a NUL byte")
+	}
+	isAccess, err := odbcAccessDriver(dsn)
+	if err != nil {
+		return nil, err
 	}
 	if err := d.initialize(); err != nil {
 		return nil, err
@@ -65,7 +130,6 @@ func (d *Driver) Open(dsn string) (driver.Conn, error) {
 		defer releaseHandle(h, &d.stats)
 		return nil, NewError("SQLDriverConnect", h)
 	}
-	isAccess := strings.Contains(strings.ToUpper(strings.Replace(dsn, " ", "", -1)), accessDriverSubstr)
 	return &Conn{h: h, stats: &d.stats, isMSAccessDriver: isAccess}, nil
 }
 

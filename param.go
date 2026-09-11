@@ -129,8 +129,12 @@ func (p *Parameter) BindValue(h api.SQLHSTMT, idx int, v driver.Value, conn *Con
 	case time.Time:
 		ctype = api.SQL_C_TYPE_TIMESTAMP
 		y, m, day := d.Date()
+		year := api.SQLSMALLINT(y)
+		if int(year) != y {
+			return fmt.Errorf("timestamp year %d is outside the ODBC field range", y)
+		}
 		b := api.SQL_TIMESTAMP_STRUCT{
-			Year:     api.SQLSMALLINT(y),
+			Year:     year,
 			Month:    api.SQLUSMALLINT(m),
 			Day:      api.SQLUSMALLINT(day),
 			Hour:     api.SQLUSMALLINT(d.Hour()),
@@ -244,9 +248,12 @@ func (p *Parameter) unpin() {
 	p.indicator = nil
 }
 
+// ExtractParameters reads parameter metadata for h. Inference is allowed only
+// when every SQLDescribeParam diagnostic is IM001, HYC00 or S1C00. Other errors
+// discard partial metadata and propagate to the statement's failure handling.
 func ExtractParameters(h api.SQLHSTMT) ([]Parameter, error) {
 	// count parameters
-	var n, nullable api.SQLSMALLINT
+	var n api.SQLSMALLINT
 	ret, callErr := safeSQLCall("SQLNumParams", func() api.SQLRETURN {
 		return api.SQLNumParams(h, &n)
 	})
@@ -256,6 +263,15 @@ func ExtractParameters(h api.SQLHSTMT) ([]Parameter, error) {
 	if IsError(ret) {
 		return nil, NewError("SQLNumParams", h)
 	}
+	return extractParameters(int(n), func(index int, p *Parameter) (api.SQLRETURN, error) {
+		var nullable api.SQLSMALLINT
+		return safeSQLCall("SQLDescribeParam", func() api.SQLRETURN {
+			return api.SQLDescribeParam(h, api.SQLUSMALLINT(index), &p.SQLType, &p.Size, &p.Decimal, &nullable)
+		})
+	}, func() error { return NewError("SQLDescribeParam", h) })
+}
+
+func extractParameters(n int, describe func(int, *Parameter) (api.SQLRETURN, error), diagnostic func() error) ([]Parameter, error) {
 	if n <= 0 {
 		// no parameters
 		return nil, nil
@@ -264,17 +280,20 @@ func ExtractParameters(h api.SQLHSTMT) ([]Parameter, error) {
 	// fetch param descriptions
 	for i := range ps {
 		p := &ps[i]
-		ret, callErr = safeSQLCall("SQLDescribeParam", func() api.SQLRETURN {
-			return api.SQLDescribeParam(h, api.SQLUSMALLINT(i+1),
-				&p.SQLType, &p.Size, &p.Decimal, &nullable)
-		})
+		ret, callErr := describe(i+1, p)
 		if callErr != nil {
 			return nil, callErr
 		}
 		if IsError(ret) {
-			// SQLDescribeParam is not implemented by freedts,
-			// it even fails for some statements on windows.
-			// Will try request without these descriptions
+			err := diagnostic()
+			if err == nil {
+				return nil, fmt.Errorf("SQLDescribeParam failed without diagnostics")
+			}
+			if !unsupportedParamDescription(err) {
+				return nil, err
+			}
+			// Discard fields partially written by an unsupported native call.
+			*p = Parameter{}
 			continue
 		}
 		p.isDescribed = true
@@ -292,4 +311,20 @@ func ExtractParameters(h api.SQLHSTMT) ([]Parameter, error) {
 		}
 	}
 	return ps, nil
+}
+
+func unsupportedParamDescription(err error) bool {
+	// A wrapped diagnostic may be truncated or joined with another failure.
+	d, ok := err.(*Error)
+	if !ok || d == nil || d.APIName != "SQLDescribeParam" || len(d.Diag) == 0 {
+		return false
+	}
+	for _, record := range d.Diag {
+		switch record.State {
+		case "IM001", "HYC00", "S1C00":
+		default:
+			return false
+		}
+	}
+	return true
 }

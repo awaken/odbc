@@ -9,6 +9,7 @@ import (
 	"database/sql"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"github.com/alexbrainman/odbc/api"
 )
@@ -33,7 +34,7 @@ type Driver struct {
 	h        api.SQLHENV // environment handle
 	initOnce sync.Once
 	initErr  error
-	poolMode DriverPoolMode
+	poolMode atomic.Int32
 }
 
 // Stats returns a synchronized snapshot of the native handles currently owned
@@ -44,17 +45,21 @@ func (d *Driver) Stats() Stats {
 
 // PoolMode returns the connection pooling mode enabled during driver initialization.
 func (d *Driver) PoolMode() DriverPoolMode {
-	return d.poolMode
+	return DriverPoolMode(d.poolMode.Load())
 }
 
 // IsPooling reports whether connection pooling is enabled.
 func (d *Driver) IsPooling() bool {
-	return d.poolMode != DriverPoolModeNone
+	return d.PoolMode() != DriverPoolModeNone
 }
 
 // IsFullPooling reports whether connection pooling uses relaxed connection matching.
 func (d *Driver) IsFullPooling() bool {
-	return d.poolMode == DriverPoolModeFull
+	return d.PoolMode() == DriverPoolModeFull
+}
+
+func (d *Driver) setPoolMode(mode DriverPoolMode) {
+	d.poolMode.Store(int32(mode))
 }
 
 // Close releases the ODBC environment handle owned by d.
@@ -64,8 +69,11 @@ func (d *Driver) Close() error {
 	if h == api.SQLHENV(api.SQL_NULL_HENV) {
 		return nil
 	}
+	if err := releaseHandle(h, &d.stats); err != nil {
+		return err
+	}
 	d.h = api.SQLHENV(api.SQL_NULL_HENV)
-	return releaseHandle(h, &d.stats)
+	return nil
 }
 
 func (d *Driver) initialize() error {
@@ -90,9 +98,9 @@ func (d *Driver) initDriver() error {
 		ret = api.SQL_ERROR
 	}
 	if IsError(ret) {
-		d.poolMode = DriverPoolModeNone
+		d.setPoolMode(DriverPoolModeNone)
 	} else {
-		d.poolMode = DriverPoolModeBasic
+		d.setPoolMode(DriverPoolModeBasic)
 	}
 
 	//Allocate environment handle
@@ -133,7 +141,7 @@ func (d *Driver) initDriver() error {
 			return api.SQLSetEnvUIntPtrAttr(d.h, api.SQL_ATTR_CP_MATCH, api.SQL_CP_RELAXED_MATCH, api.SQL_IS_UINTEGER)
 		})
 		if callErr == nil && !IsError(ret) {
-			d.poolMode = DriverPoolModeFull
+			d.setPoolMode(DriverPoolModeFull)
 		}
 	}
 

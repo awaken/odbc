@@ -9,7 +9,6 @@ package odbc
 import (
 	"database/sql"
 	"flag"
-	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -24,14 +23,25 @@ var (
 
 func mysqlConnect() (db *sql.DB, stmtCount int, err error) {
 	// from https://dev.mysql.com/doc/connector-odbc/en/connector-odbc-configuration-connection-parameters.html
-	conn := fmt.Sprintf("driver=mysql;server=%s;database=%s;user=%s;password=%s;",
-		*mysrv, *mydb, *myuser, *mypass)
+	conn := mysqlConnectionString(*mysrv, *mydb, *myuser, *mypass)
 	db, err = sql.Open("odbc", conn)
 	if err != nil {
 		return nil, 0, err
 	}
 	stats := db.Driver().(*Driver).Stats()
 	return db, stats.StmtCount, nil
+}
+
+func mysqlConnectionString(server, database, user, password string) string {
+	return makeODBCAttributes(connParams{"driver": "mysql", "server": server, "database": database, "user": user, "password": password})
+}
+
+func TestMySQLSyntheticConnectionString(t *testing.T) {
+	got := mysqlConnectionString("local", "db;name", " test ", "a}b;c")
+	want := "database={db;name};driver={mysql};password={a}}b;c};server={local};user={ test };"
+	if got != want {
+		t.Fatalf("synthetic DSN = %q; want %q", got, want)
+	}
 }
 
 func TestMYSQLTime(t *testing.T) {

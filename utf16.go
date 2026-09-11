@@ -20,15 +20,9 @@ const (
 	surr3 = 0xe000
 )
 
-// utf16toutf8 returns the UTF-8 encoding of the UTF-16 sequence s,
-// with a terminating NUL removed.
+// utf16toutf8 returns the UTF-8 encoding of the complete UTF-16 sequence s.
+// Callers use the ODBC length indicator to exclude a transport terminator.
 func utf16toutf8(s []uint16) []byte {
-	for i, v := range s {
-		if v == 0 {
-			s = s[0:i]
-			break
-		}
-	}
 	buf := make([]byte, 0, len(s)*2) // allow 2 bytes for every rune
 	b := make([]byte, 4)
 	for i := 0; i < len(s); i++ {

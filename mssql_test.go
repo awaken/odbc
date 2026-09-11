@@ -15,9 +15,11 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"os"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -107,15 +109,29 @@ func (params connParams) updateConnAddress(address string) error {
 }
 
 func (params connParams) makeODBCConnectionString() string {
+	params = maps.Clone(params)
 	if port, ok := params["port"]; ok {
 		params["server"] += "," + port
 		delete(params, "port")
 	}
-	var c string
-	for n, v := range params {
-		c += n + "=" + v + ";"
+	return makeODBCAttributes(params)
+}
+
+// makeODBCAttributes encodes fixed test attribute names without interpreting their values.
+func makeODBCAttributes(params connParams) string {
+	keys := make([]string, 0, len(params))
+	for key := range params {
+		keys = append(keys, key)
 	}
-	return c
+	slices.Sort(keys)
+	var result strings.Builder
+	for _, key := range keys {
+		result.WriteString(key)
+		result.WriteString("={")
+		result.WriteString(strings.ReplaceAll(params[key], "}", "}}"))
+		result.WriteString("};")
+	}
+	return result.String()
 }
 
 func mssqlConnectWithParams(params connParams) (db *sql.DB, stmtCount int, err error) {
@@ -2067,5 +2083,37 @@ func TestMSSQLQueryContextCancel(t *testing.T) {
 	}
 	if err != context.Canceled {
 		t.Fatalf("Unexpected error value: should=%s, is=%s", context.Canceled, err)
+	}
+}
+
+func TestMSSQLSyntheticConnectionString(t *testing.T) {
+	params := connParams{"driver": "test", "server": "local", "port": "1433", "uid": " test ", "pwd": "a}b;c"}
+	want := "driver={test};pwd={a}}b;c};server={local,1433};uid={ test };"
+	first := params.makeODBCConnectionString()
+	if first != want {
+		t.Errorf("synthetic DSN = %q; want %q", first, want)
+	}
+	if params["server"] != "local" || params["port"] != "1433" || len(params) != 5 {
+		t.Error("DSN construction mutated connection parameters")
+	}
+	if next := params.makeODBCConnectionString(); next != want {
+		t.Fatalf("repeat DSN = %q; want %q", next, want)
+	}
+}
+
+func TestODBCSyntheticAttributeBoundaries(t *testing.T) {
+	for _, tc := range []struct{ value, encoded string }{
+		{"", "{}"}, {"plain", "{plain}"}, {" a ", "{ a }"},
+		{"a=b;c", "{a=b;c}"}, {"{a}}", "{{a}}}}}"}, {"雪", "{雪}"},
+	} {
+		if got := makeODBCAttributes(connParams{"value": tc.value}); got != "value="+tc.encoded+";" {
+			t.Fatalf("encode %q: %q", tc.value, got)
+		}
+	}
+	if got := makeODBCAttributes(nil); got != "" {
+		t.Fatalf("nil attributes = %q", got)
+	}
+	if got := (connParams{"server": "local"}).makeODBCConnectionString(); got != "server={local};" {
+		t.Fatalf("server without port = %q", got)
 	}
 }

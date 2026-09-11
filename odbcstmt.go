@@ -26,9 +26,10 @@ type ODBCStmt struct {
 	Cols        []Column
 	retiredCols [][]Column
 	// locking/lifetime
-	mu         sync.Mutex
-	usedByStmt bool
-	usedByRows bool
+	mu            sync.Mutex
+	usedByStmt    bool
+	usedByRows    bool
+	noMoreResults bool
 }
 
 var pinnedStatements = struct {
@@ -57,6 +58,13 @@ func (s *ODBCStmt) isUsedByRows() bool {
 func (s *ODBCStmt) markUsedByRows() {
 	s.mu.Lock()
 	s.usedByRows = true
+	s.noMoreResults = false
+	s.mu.Unlock()
+}
+
+func (s *ODBCStmt) markNoMoreResults() {
+	s.mu.Lock()
+	s.noMoreResults = true
 	s.mu.Unlock()
 }
 
@@ -160,6 +168,10 @@ func (s *ODBCStmt) closeByRows() error {
 	if s.usedByRows {
 		defer func() { s.usedByRows = false }()
 		if s.usedByStmt {
+			// SQLMoreResults closes the cursor when it reports SQL_NO_DATA.
+			if s.noMoreResults {
+				return nil
+			}
 			ret, callErr := safeSQLCall("SQLCloseCursor", func() api.SQLRETURN {
 				return api.SQLCloseCursor(s.h)
 			})

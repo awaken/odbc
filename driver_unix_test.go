@@ -17,6 +17,39 @@ import (
 	"github.com/alexbrainman/odbc/api"
 )
 
+func TestDriverCloseRetainsFailedEnvironmentHandle(t *testing.T) {
+	dsn := os.Getenv("ODBC_SQLITE_DSN")
+	if dsn == "" {
+		t.Skip("set ODBC_SQLITE_DSN to exercise native environment cleanup")
+	}
+
+	driver := new(Driver)
+	connection, err := driver.Open(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = connection.Close()
+		_ = driver.Close()
+	})
+
+	if err := driver.Close(); err == nil {
+		t.Error("closing an environment with a live connection unexpectedly succeeded")
+	}
+	if driver.h == api.SQLHENV(api.SQL_NULL_HENV) {
+		t.Error("failed close discarded the still-owned environment handle")
+	}
+	if err := connection.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := driver.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := driver.Stats().EnvCount; got != 0 {
+		t.Fatalf("environment handles = %d; want 0", got)
+	}
+}
+
 func TestUnavailableDriverManagerDoesNotStopProcess(t *testing.T) {
 	const helperEnvironment = "ODBC_UNAVAILABLE_HELPER"
 	if os.Getenv(helperEnvironment) == "1" {

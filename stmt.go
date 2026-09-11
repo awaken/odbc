@@ -158,11 +158,15 @@ func (s *Stmt) execBound(os *ODBCStmt) (driver.Result, error) {
 }
 
 func (s *Stmt) execBoundResults(os *ODBCStmt) (driver.Result, error) {
-	var sumRowCount int64
+	return s.execResults(os, api.SQLRowCount, api.SQLMoreResults)
+}
+
+func (s *Stmt) execResults(os *ODBCStmt, rowCount func(api.SQLHSTMT, *api.SQLLEN) api.SQLRETURN, moreResults func(api.SQLHSTMT) api.SQLRETURN) (driver.Result, error) {
+	result := new(Result)
 	for {
 		var c api.SQLLEN
 		ret, callErr := safeSQLCall("SQLRowCount", func() api.SQLRETURN {
-			return api.SQLRowCount(os.h, &c)
+			return rowCount(os.h, &c)
 		})
 		if callErr != nil {
 			s.c.invalidate()
@@ -171,9 +175,9 @@ func (s *Stmt) execBoundResults(os *ODBCStmt) (driver.Result, error) {
 		if IsError(ret) {
 			return nil, s.c.newError("SQLRowCount", os.h)
 		}
-		sumRowCount += int64(c)
+		result.addRowCount(int64(c))
 		ret, callErr = safeSQLCall("SQLMoreResults", func() api.SQLRETURN {
-			return api.SQLMoreResults(os.h)
+			return moreResults(os.h)
 		})
 		if callErr != nil {
 			s.c.invalidate()
@@ -186,7 +190,7 @@ func (s *Stmt) execBoundResults(os *ODBCStmt) (driver.Result, error) {
 			return nil, s.c.newError("SQLMoreResults", os.h)
 		}
 	}
-	return &Result{rowCount: sumRowCount}, nil
+	return result, nil
 }
 
 func (s *Stmt) Query(args []driver.Value) (driver.Rows, error) {
@@ -258,5 +262,5 @@ func (s *Stmt) queryBoundResults(os *ODBCStmt) (driver.Rows, error) {
 		return nil, err
 	}
 	os.markUsedByRows() // now both Stmt and Rows refer to it
-	return &Rows{os: os, c: s.c}, nil
+	return &Rows{rowsCursor: &odbcRows{os: os, c: s.c}}, nil
 }

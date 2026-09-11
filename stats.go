@@ -16,7 +16,7 @@ import (
 // concurrently with driver operations.
 type Stats struct {
 	// EnvCount is the number of allocated environment handles.
-	EnvCount  int
+	EnvCount int
 	// ConnCount is the number of allocated connection handles.
 	ConnCount int
 	// StmtCount is the number of allocated statement handles.
