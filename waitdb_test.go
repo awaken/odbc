@@ -75,8 +75,9 @@ esac
 	if err := os.WriteFile(filepath.Join(root, "docker"), []byte(mock), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	cmd := osexec.Command("timeout", "--kill-after=1s", "3s", "make", "--no-print-directory", "-f", makefile,
-		"start-"+backend, "ODBC_READY_TIMEOUT=1", "ODBC_COMMAND_TIMEOUT=1", "PASSWORD=synthetic")
+	// Leave setup time before Bash's whole-second readiness deadline.
+	cmd := osexec.Command("timeout", "--kill-after=1s", "5s", "make", "--no-print-directory", "-f", makefile,
+		"start-"+backend, "ODBC_READY_TIMEOUT=2", "ODBC_COMMAND_TIMEOUT=1", "PASSWORD=synthetic")
 	cmd.Dir = root
 	cmd.Env = append(os.Environ(), "PATH="+root+string(os.PathListSeparator)+os.Getenv("PATH"),
 		"ODBC_TEST_MODE="+mode, "ODBC_TEST_BACKEND="+backend, "ODBC_TEST_CALLS="+calls)
@@ -87,7 +88,6 @@ esac
 	}
 	return string(output), string(data), runErr
 }
-
 
 func TestWaitDBRejectsInvalidOptions(t *testing.T) {
 	script, err := filepath.Abs("waitdb.sh")
