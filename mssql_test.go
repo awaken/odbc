@@ -161,7 +161,7 @@ func closeDB(t *testing.T, db *sql.DB, shouldStmtCount, ignoreIfStmtCount int) {
 	case ignoreIfStmtCount:
 		t.Logf("ignoring unexpected StmtCount of %v", ignoreIfStmtCount)
 	default:
-		t.Errorf("unexpected StmtCount: should=%v, is=%v", ignoreIfStmtCount, s.StmtCount)
+		t.Errorf("unexpected StmtCount: should=%v, is=%v", shouldStmtCount, s.StmtCount)
 	}
 }
 
@@ -2472,4 +2472,27 @@ func mssqlProxyEcho(t *testing.T) net.Listener {
 		active.Wait()
 	})
 	return ln
+}
+
+func TestCloseDBLeakDiagnostic(t *testing.T) {
+	if os.Getenv("ODBC_TEST_CLOSE_DIAGNOSTIC") == "1" {
+		// sql.Open is lazy: this path opens no native connection.
+		db, err := sql.Open("odbc", "Driver={synthetic};")
+		if err != nil {
+			t.Fatal(err)
+		}
+		closeDB(t, db, 7, 11)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := osexec.CommandContext(ctx, os.Args[0], "-test.run=^TestCloseDBLeakDiagnostic$", "-test.count=1")
+	cmd.Env = append(os.Environ(), "ODBC_TEST_CLOSE_DIAGNOSTIC=1")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatal("expected a handle-count diagnostic")
+	}
+	if !strings.Contains(string(out), "unexpected StmtCount: should=7, is=0") {
+		t.Fatalf("incorrect expected handle count: %s", out)
+	}
 }

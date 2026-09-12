@@ -2,6 +2,9 @@
 DB_NAME=test
 ODBC_READY_TIMEOUT?=120
 ODBC_COMMAND_TIMEOUT?=10
+# Set to 1 to retain a test container for inspection after it exits.
+ODBC_TEST_KEEP?=0
+ODBC_TEST_REMOVE=$(if $(filter 1,$(ODBC_TEST_KEEP)),,--rm)
 ODBC_DIR:=$(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 export DB_NAME ODBC_READY_TIMEOUT ODBC_COMMAND_TIMEOUT
 PASSWORD=Passw0rd
@@ -41,7 +44,7 @@ build-unixodbc:
 
 test-mssql:
 	docker run \
-		-it \
+		$(ODBC_TEST_REMOVE) \
 		--network=${MSSQL_NETWORK} \
 		-e ODBC_MSSQL_PASSWORD \
 		-v .:/src \
@@ -53,7 +56,7 @@ test-mssql:
 
 test-mssql-freetds:
 	docker run \
-		-it \
+		$(ODBC_TEST_REMOVE) \
 		--network=${MSSQL_NETWORK} \
 		-e ODBC_MSSQL_PASSWORD \
 		-v .:/src \
@@ -66,7 +69,7 @@ test-mssql-freetds:
 
 test-mssql-race:
 	docker run \
-		-it \
+		$(ODBC_TEST_REMOVE) \
 		--network=${MSSQL_NETWORK} \
 		-e ODBC_MSSQL_PASSWORD \
 		-v .:/src \

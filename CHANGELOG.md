@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+## v0.1.2 - 2026-09-12
+
+- Run SQL Server test containers without TTY flags and remove them on exit.
+  Set `ODBC_TEST_KEEP=1` to retain a container for inspection.
+- Release Access COM references and results before COM uninitialization on the
+  same OS thread; report database-close and temporary-directory cleanup errors.
+- Print the expected statement count in SQL Server leak diagnostics.
+
+Addresses F1199, F1203 and F1204. These changes affect test tooling.
+
 ## v0.1.1 - 2026-09-12
 
 - Return context cancellation from connection startup, preparation, execution
