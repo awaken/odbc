@@ -76,21 +76,15 @@ func (p *Parameter) BindValue(h api.SQLHSTMT, idx int, v driver.Value, conn *Con
 		buflen = api.SQLLEN(l)
 		indicatorValue = buflen
 		hasIndicator = true
-		if !conn.isMSAccessDriver {
-			switch {
-			case size >= 4000:
-				sqltype = api.SQL_WLONGVARCHAR
-			case p.isDescribed:
-				sqltype = p.SQLType
-			case size <= 1:
-				sqltype = api.SQL_WVARCHAR
-			default:
-				sqltype = api.SQL_WCHAR
-			}
-		} else {
-			// MS Acess requires SQL_WLONGVARCHAR for MEMO.
-			// https://docs.microsoft.com/en-us/sql/odbc/microsoft/microsoft-access-data-types
+		switch {
+		case size >= 4000:
 			sqltype = api.SQL_WLONGVARCHAR
+		case p.isDescribed:
+			sqltype = p.SQLType
+		case size <= 1:
+			sqltype = api.SQL_WVARCHAR
+		default:
+			sqltype = api.SQL_WCHAR
 		}
 	case int64:
 		if int64FitsInt32(d) {

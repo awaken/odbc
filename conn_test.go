@@ -87,44 +87,41 @@ func TestConnectionInvalidationConcurrent(t *testing.T) {
 	}
 }
 
-func TestODBCDriverAttributeIdentity(t *testing.T) {
+func TestODBCDriverAttributes(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		dsn     string
-		access  bool
 		invalid bool
 	}{
-		{name: "legacy Access", dsn: "DRIVER={Microsoft Access Driver (*.mdb)}", access: true},
-		{name: "modern Access", dsn: "DRIVER={Microsoft Access Driver (*.mdb, *.accdb)};DBQ=fixture", access: true},
-		{name: "unbraced Access", dsn: "driver=Microsoft Access Driver (*.mdb)", access: true},
-		{name: "case and spacing", dsn: " driver = {microsoft access driver (*.mdb)} ; DBQ=fixture", access: true},
+		{name: "braced driver", dsn: "DRIVER={SQLite3}"},
+		{name: "unbraced driver", dsn: "driver=SQLite3"},
+		{name: "case and spacing", dsn: " driver = {sqlite3} ; Database=fixture"},
 		{name: "other driver", dsn: "DRIVER={SQLite3};Database=fixture"},
 		{name: "named DSN", dsn: "DSN=fixture"},
 		{name: "empty", dsn: " ; ; "},
-		{name: "unrelated unbraced value", dsn: "Description=DRIVER={Microsoft Access Driver (*.mdb)};DRIVER={SQLite3}"},
-		{name: "unrelated braced value", dsn: "Description={note;DRIVER={Microsoft Access Driver (*.mdb)}}};DRIVER={SQLite3}"},
-		{name: "driver-looking key", dsn: "NotDriver={Microsoft Access Driver (*.mdb)};DRIVER={SQLite3}"},
-		{name: "driver name suffix", dsn: "DRIVER={Microsoft Access Driver lookalike}"},
+		{name: "unrelated unbraced value", dsn: "Description=DRIVER={Other};DRIVER={SQLite3}"},
+		{name: "unrelated braced value", dsn: "Description={note;DRIVER={Other}}};DRIVER={SQLite3}"},
+		{name: "driver-looking key", dsn: "NotDriver={Other};DRIVER={SQLite3}"},
 		{name: "escaped driver brace", dsn: "DRIVER={Other}}Driver}"},
-		{name: "equal duplicates", dsn: "DRIVER={Microsoft Access Driver (*.mdb)};driver=MICROSOFT ACCESS DRIVER (*.mdb)", access: true},
-		{name: "conflicting duplicates", dsn: "DRIVER={SQLite3};DRIVER={Microsoft Access Driver (*.mdb)}", invalid: true},
-		{name: "reversed conflicting duplicates", dsn: "DRIVER={Microsoft Access Driver (*.mdb)};DRIVER={SQLite3}", invalid: true},
-		{name: "unclosed brace", dsn: "DRIVER={Microsoft Access Driver (*.mdb)", invalid: true},
+		{name: "equal duplicates", dsn: "DRIVER={SQLite3};driver=sqlite3"},
+		{name: "conflicting duplicates", dsn: "DRIVER={SQLite3};DRIVER={Other}", invalid: true},
+		{name: "reversed conflicting duplicates", dsn: "DRIVER={Other};DRIVER={SQLite3}", invalid: true},
+		{name: "unclosed brace", dsn: "DRIVER={SQLite3", invalid: true},
 		{name: "trailing characters", dsn: "DRIVER={SQLite3}suffix", invalid: true},
 		{name: "missing equals", dsn: "DSN;DRIVER={SQLite3}", invalid: true},
 		{name: "empty key", dsn: "={SQLite3}", invalid: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			access, err := odbcAccessDriver(tc.dsn)
-			if access != tc.access || (err != nil) != tc.invalid {
-				t.Fatalf("Access=%t err=%v; want Access=%t invalid=%t", access, err, tc.access, tc.invalid)
+			connector, err := new(Driver).OpenConnector(tc.dsn)
+			if (connector == nil) != tc.invalid || (err != nil) != tc.invalid {
+				t.Fatalf("connector=%v err=%v; want invalid=%t", connector, err, tc.invalid)
 			}
 		})
 	}
 }
 
 func TestODBCBadAttributesBeforeOpen(t *testing.T) {
-	for _, dsn := range []string{"DRIVER={SQLite3}trailing", "DRIVER={SQLite3};DRIVER={Microsoft Access Driver (*.mdb)}"} {
+	for _, dsn := range []string{"DRIVER={SQLite3}trailing", "DRIVER={SQLite3};DRIVER={Other}"} {
 		d := new(Driver)
 		conn, err := d.Open(dsn)
 		if conn != nil || err == nil || d.h != 0 || strings.Contains(err.Error(), "SQLite3") {

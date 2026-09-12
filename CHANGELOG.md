@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## v0.1.3 - 2026-09-12
+
+- Remove Microsoft Access support, its integration test and the `go-ole` COM
+  dependency. String parameters use the standard ODBC binding rules.
+- Retain validation of malformed and conflicting connection-string attributes.
+
 ## v0.1.2 - 2026-09-12
 
 - Run SQL Server test containers without TTY flags and remove them on exit.

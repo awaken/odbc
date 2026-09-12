@@ -74,10 +74,8 @@ container on exit, including failure. Use `make ODBC_TEST_KEEP=1 test-mssql`
 (or the FreeTDS/race target) to retain it for inspection; remove it afterward.
 The separate database container remains controlled by the start/stop targets.
 
-Access integration cleanup releases its catalog, object and call result before
-COM uninitialization, all on the initializing OS thread. Database-close and
-file-removal errors fail the test. Native Access execution requires a matching
-Windows driver/provider and is distinct from COM ownership-model validation.
+Microsoft Access is unsupported. The fork has no Access-specific parameter
+handling, integration tests or COM setup dependency.
 
 The SQL Server test proxy reports the first unexpected connection error to its
 owning test and joins all proxy work during cleanup. Dials have a five-second

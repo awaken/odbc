@@ -18,17 +18,16 @@ import (
 )
 
 type Conn struct {
-	driver           *Driver
-	closeTimeout     time.Duration
-	ownerOnce        sync.Once
-	owner            *connOwner
-	statements       map[*ODBCStmt]struct{}
-	connected        bool
-	h                api.SQLHDBC
-	stats            *handleStats
-	tx               *Tx
-	bad              atomic.Bool
-	isMSAccessDriver bool
+	driver       *Driver
+	closeTimeout time.Duration
+	ownerOnce    sync.Once
+	owner        *connOwner
+	statements   map[*ODBCStmt]struct{}
+	connected    bool
+	h            api.SQLHDBC
+	stats        *handleStats
+	tx           *Tx
+	bad          atomic.Bool
 }
 
 var _ driver.ConnPrepareContext = (*Conn)(nil)
@@ -39,10 +38,10 @@ var _ driver.DriverContext = (*Driver)(nil)
 
 var errODBCAttributes = errors.New("malformed ODBC connection string attributes")
 
-// odbcAccessDriver reads only DRIVER, honoring braced values and escaped closing
-// braces. Equal case-insensitive duplicates are accepted; conflicting values are
-// rejected before connecting. Named DSNs alone do not identify an Access driver.
-func odbcAccessDriver(dsn string) (bool, error) {
+// validateODBCAttributes checks syntax and DRIVER consistency before native I/O.
+// Braced values may contain escaped closing braces. Equal case-insensitive
+// DRIVER duplicates are accepted; error messages omit attribute values.
+func validateODBCAttributes(dsn string) error {
 	var driverName string
 	seen := false
 	for {
@@ -53,7 +52,7 @@ func odbcAccessDriver(dsn string) (bool, error) {
 		key, rest, ok := strings.Cut(dsn, "=")
 		key = strings.TrimSpace(key)
 		if !ok || key == "" || strings.Contains(key, ";") {
-			return false, errODBCAttributes
+			return errODBCAttributes
 		}
 		rest = strings.TrimLeft(rest, " \t\r\n")
 		var value string
@@ -75,12 +74,12 @@ func odbcAccessDriver(dsn string) (bool, error) {
 				i++
 			}
 			if !closed {
-				return false, errODBCAttributes
+				return errODBCAttributes
 			}
 			value = b.String()
 			dsn = strings.TrimLeft(rest[i:], " \t\r\n")
 			if dsn != "" && dsn[0] != ';' {
-				return false, errODBCAttributes
+				return errODBCAttributes
 			}
 		} else {
 			value, dsn, _ = strings.Cut(rest, ";")
@@ -88,17 +87,15 @@ func odbcAccessDriver(dsn string) (bool, error) {
 		if strings.EqualFold(key, "DRIVER") {
 			value = strings.TrimSpace(value)
 			if seen && !strings.EqualFold(driverName, value) {
-				return false, errors.New("conflicting ODBC DRIVER attributes")
+				return errors.New("conflicting ODBC DRIVER attributes")
 			}
 			driverName, seen = value, true
 		}
 	}
-	return strings.EqualFold(driverName, "Microsoft Access Driver (*.mdb)") ||
-		strings.EqualFold(driverName, "Microsoft Access Driver (*.mdb, *.accdb)"), nil
+	return nil
 }
 
-// Open connects using dsn. DRIVER names alone select Access parameter handling;
-// conflicting duplicate DRIVER attributes and malformed attribute syntax fail
+// Open connects using dsn. Conflicting duplicate DRIVER attributes and malformed syntax fail
 // before a connection is opened. Attribute validation errors omit dsn values.
 func (d *Driver) Open(dsn string) (driver.Conn, error) {
 	connector, err := d.OpenConnector(dsn)
@@ -114,17 +111,15 @@ func (d *Driver) OpenConnector(dsn string) (driver.Connector, error) {
 	if strings.IndexByte(dsn, 0) >= 0 {
 		return nil, errors.New("ODBC connection string contains a NUL byte")
 	}
-	isAccess, err := odbcAccessDriver(dsn)
-	if err != nil {
+	if err := validateODBCAttributes(dsn); err != nil {
 		return nil, err
 	}
-	return &connConnector{driver: d, dsn: dsn, isAccess: isAccess}, nil
+	return &connConnector{driver: d, dsn: dsn}, nil
 }
 
 type connConnector struct {
-	driver   *Driver
-	dsn      string
-	isAccess bool
+	driver *Driver
+	dsn    string
 }
 
 func (n *connConnector) Driver() driver.Driver { return n.driver }
@@ -136,7 +131,7 @@ func (n *connConnector) Connect(ctx context.Context) (driver.Conn, error) {
 	if err := n.driver.acquireNativeSlot(); err != nil {
 		return nil, err
 	}
-	c := &Conn{stats: &n.driver.stats, driver: n.driver, closeTimeout: n.driver.CloseTimeout, isMSAccessDriver: n.isAccess}
+	c := &Conn{stats: &n.driver.stats, driver: n.driver, closeTimeout: n.driver.CloseTimeout}
 	_, err := runNative(ctx, c, func() (struct{}, error) {
 		return struct{}{}, c.openNative(n.dsn)
 	}, true)
