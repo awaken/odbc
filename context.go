@@ -22,7 +22,7 @@ func runContextOperation[T any](ctx context.Context, operation func() (T, error)
 
 	resultChan := make(chan contextResult[T], 1)
 	go func() {
-		value, err := operation()
+		value, err := callOperation(operation)
 		resultChan <- contextResult[T]{value: value, err: err}
 	}()
 

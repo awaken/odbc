@@ -10,6 +10,9 @@ import (
 	"unicode/utf16"
 )
 
+// SQL_UNBIND removes all result-column bindings from a statement.
+const SQL_UNBIND SQLUSMALLINT = 2
+
 type (
 	SQL_DATE_STRUCT struct {
 		Year  SQLSMALLINT
@@ -53,6 +56,7 @@ type (
 //sys	SQLExecute(statementHandle SQLHSTMT) (ret SQLRETURN) = odbc32.SQLExecute
 //sys	SQLFetch(statementHandle SQLHSTMT) (ret SQLRETURN) = odbc32.SQLFetch
 //sys	SQLFreeHandle(handleType SQLSMALLINT, handle SQLHANDLE) (ret SQLRETURN) = odbc32.SQLFreeHandle
+//sys	SQLFreeStmt(statementHandle SQLHSTMT, option SQLUSMALLINT) (ret SQLRETURN) = odbc32.SQLFreeStmt
 //sys	SQLGetData(statementHandle SQLHSTMT, colOrParamNum SQLUSMALLINT, targetType SQLSMALLINT, targetValuePtr SQLPOINTER, bufferLength SQLLEN, vallen *SQLLEN) (ret SQLRETURN) = odbc32.SQLGetData
 //sys	SQLGetDiagRec(handleType SQLSMALLINT, handle SQLHANDLE, recNumber SQLSMALLINT, sqlState *SQLWCHAR, nativeErrorPtr *SQLINTEGER, messageText *SQLWCHAR, bufferLength SQLSMALLINT, textLengthPtr *SQLSMALLINT) (ret SQLRETURN) = odbc32.SQLGetDiagRecW
 //sys	SQLNumParams(statementHandle SQLHSTMT, parameterCountPtr *SQLSMALLINT) (ret SQLRETURN) = odbc32.SQLNumParams

@@ -31,6 +31,7 @@ type nativeFunctions struct {
 	SQLExecute        func(SQLHSTMT) SQLRETURN
 	SQLFetch          func(SQLHSTMT) SQLRETURN
 	SQLFreeHandle     func(SQLSMALLINT, SQLHANDLE) SQLRETURN
+	SQLFreeStmt       func(SQLHSTMT, SQLUSMALLINT) SQLRETURN
 	SQLGetData        func(SQLHSTMT, SQLUSMALLINT, SQLSMALLINT, SQLPOINTER, SQLLEN, *SQLLEN) SQLRETURN
 	SQLGetDiagRec     func(SQLSMALLINT, SQLHANDLE, SQLSMALLINT, *SQLWCHAR, *SQLINTEGER, *SQLWCHAR, SQLSMALLINT, *SQLSMALLINT) SQLRETURN
 	SQLNumParams      func(SQLHSTMT, *SQLSMALLINT) SQLRETURN
@@ -152,6 +153,7 @@ func bindNativeFunctions(handle uintptr, functions *nativeFunctions, bind bindFu
 		{"SQLExecute", &functions.SQLExecute},
 		{"SQLFetch", &functions.SQLFetch},
 		{"SQLFreeHandle", &functions.SQLFreeHandle},
+		{"SQLFreeStmt", &functions.SQLFreeStmt},
 		{"SQLGetData", &functions.SQLGetData},
 		{"SQLGetDiagRecW", &functions.SQLGetDiagRec},
 		{"SQLNumParams", &functions.SQLNumParams},
@@ -273,6 +275,13 @@ func SQLFreeHandle(handleType SQLSMALLINT, handle SQLHANDLE) SQLRETURN {
 		return SQL_ERROR
 	}
 	return driverManager.functions.SQLFreeHandle(handleType, handle)
+}
+
+func SQLFreeStmt(statementHandle SQLHSTMT, option SQLUSMALLINT) SQLRETURN {
+	if InitError() != nil {
+		return SQL_ERROR
+	}
+	return driverManager.functions.SQLFreeStmt(statementHandle, option)
 }
 
 func SQLGetData(statementHandle SQLHSTMT, colOrParamNum SQLUSMALLINT, targetType SQLSMALLINT, targetValuePtr SQLPOINTER, bufferLength SQLLEN, vallen *SQLLEN) SQLRETURN {

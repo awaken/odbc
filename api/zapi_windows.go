@@ -52,6 +52,7 @@ var (
 	procSQLExecute         = mododbc32.NewProc("SQLExecute")
 	procSQLFetch           = mododbc32.NewProc("SQLFetch")
 	procSQLFreeHandle      = mododbc32.NewProc("SQLFreeHandle")
+	procSQLFreeStmt        = mododbc32.NewProc("SQLFreeStmt")
 	procSQLGetData         = mododbc32.NewProc("SQLGetData")
 	procSQLGetDiagRecW     = mododbc32.NewProc("SQLGetDiagRecW")
 	procSQLNumParams       = mododbc32.NewProc("SQLNumParams")
@@ -137,6 +138,12 @@ func SQLFetch(statementHandle SQLHSTMT) (ret SQLRETURN) {
 
 func SQLFreeHandle(handleType SQLSMALLINT, handle SQLHANDLE) (ret SQLRETURN) {
 	r0, _, _ := syscall.Syscall(procSQLFreeHandle.Addr(), 2, uintptr(handleType), uintptr(handle), 0)
+	ret = SQLRETURN(r0)
+	return
+}
+
+func SQLFreeStmt(statementHandle SQLHSTMT, option SQLUSMALLINT) (ret SQLRETURN) {
+	r0, _, _ := syscall.Syscall(procSQLFreeStmt.Addr(), 2, uintptr(statementHandle), uintptr(option), 0)
 	ret = SQLRETURN(r0)
 	return
 }

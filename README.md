@@ -30,6 +30,38 @@ memory corruption, or indefinitely blocked native call cannot be isolated
 inside the application process; use a separate worker process when that level
 of fault isolation is required.
 
+Context-aware connection startup, prepare, execution, transaction startup and row iteration return
+on cancellation. Each connection has one native owner. Cancellation invalidates
+the connection; its owner waits for the operation and `SQLCancel` before freeing
+handles or unpinning buffers. A late result cannot write the caller's row slice
+or return the connection to the pool. Cancellation does not prove that database
+effects were rolled back, and the driver does not request replay of started work.
+`OpenConnector` validates connection syntax before I/O; `Connect` retains native
+initialization and startup ownership even when their calls ignore cancellation.
+
+Connection, statement, row and transaction cleanup waits are bounded by
+`Driver.CloseTimeout` (default five seconds). `ErrCleanupPending` means resources
+remain owned; repeated connection close reports the eventual cleanup result.
+A canceled connection returns pending cleanup immediately. Handles with an
+unconfirmed release retain their buffers and are not retried or reused.
+
+`Driver.NativeLimit` bounds open plus quarantined connections (default 256 per
+Driver). Exhaustion returns `ErrNativeLimit` before native allocation. Configure
+both fields before the first Open and keep the SQL pool within that limit. To
+customize the driver registered as `odbc`, register a separately configured
+`Driver` under another name and select that name in `sql.Open`. Healthy worker
+stop/restart uses ordinary cancellation and fresh pool connections. A native
+call that never returns retains its capacity until process termination.
+
+These lifetime guarantees apply to the `database/sql/driver` interfaces. Raw
+`ODBCStmt`, parameter, column and `api` helpers are low-level driver components;
+callers using them directly must serialize access and retain native resources.
+
+Reused queries explicitly call `SQLFreeStmt(SQL_UNBIND)` before replacing column
+buffers, including when column counts shrink. Failed unbinds retain the old
+pins; partial binding failures retain the current generation until confirmed
+handle release. An ODBC driver manager must export `SQLFreeStmt`.
+
 To get started using ODBC, see the [wiki](../../wiki) pages.
 
 Live SQL Server and MySQL tests require the `odbc_integration` build tag and

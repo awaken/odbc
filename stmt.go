@@ -14,16 +14,21 @@ import (
 )
 
 type Stmt struct {
-	c     *Conn
-	query string
-	os    *ODBCStmt
-	mu    sync.Mutex
+	c      *Conn
+	query  string
+	os     *ODBCStmt
+	mu     sync.Mutex
+	inputs int
 }
 
 var _ driver.StmtExecContext = (*Stmt)(nil)
 var _ driver.StmtQueryContext = (*Stmt)(nil)
 
 func (c *Conn) Prepare(query string) (driver.Stmt, error) {
+	return runOwned(context.Background(), c, func() (driver.Stmt, error) { return c.prepare(query) })
+}
+
+func (c *Conn) prepare(query string) (driver.Stmt, error) {
 	if !c.IsValid() {
 		return nil, driver.ErrBadConn
 	}
@@ -31,12 +36,16 @@ func (c *Conn) Prepare(query string) (driver.Stmt, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Stmt{c: c, os: os, query: query}, nil
+	return &Stmt{c: c, os: os, query: query, inputs: len(os.Parameters)}, nil
 }
 
 // PrepareContext prepares query and interrupts the native ODBC operation when
 // ctx is cancelled.
 func (c *Conn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
+	return runOwned(ctx, c, func() (driver.Stmt, error) { return c.prepareContext(ctx, query) })
+}
+
+func (c *Conn) prepareContext(ctx context.Context, query string) (driver.Stmt, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -47,19 +56,18 @@ func (c *Conn) PrepareContext(ctx context.Context, query string) (driver.Stmt, e
 	if err != nil {
 		return nil, err
 	}
-	return &Stmt{c: c, os: os, query: query}, nil
+	return &Stmt{c: c, os: os, query: query, inputs: len(os.Parameters)}, nil
 }
 
 func (s *Stmt) NumInput() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.os == nil {
-		return -1
-	}
-	return len(s.os.Parameters)
+	return s.inputs
 }
 
 func (s *Stmt) Close() error {
+	return s.c.closeResource(s.closeNative)
+}
+
+func (s *Stmt) closeNative() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.os == nil {
@@ -74,6 +82,11 @@ func (s *Stmt) Close() error {
 }
 
 func (s *Stmt) Exec(args []driver.Value) (driver.Result, error) {
+	args = copyValues(args)
+	return runOwned(context.Background(), s.c, func() (driver.Result, error) { return s.execNative(args) })
+}
+
+func (s *Stmt) execNative(args []driver.Value) (driver.Result, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.prepareForUse(s.c.PrepareODBCStmt); err != nil {
@@ -92,7 +105,8 @@ func (s *Stmt) ExecContext(ctx context.Context, args []driver.NamedValue) (drive
 	if err != nil {
 		return nil, err
 	}
-	return s.execContext(ctx, dargs)
+	dargs = copyValues(dargs)
+	return runOwned(ctx, s.c, func() (driver.Result, error) { return s.execContext(ctx, dargs) })
 }
 
 func (s *Stmt) execContext(ctx context.Context, args []driver.Value) (driver.Result, error) {
@@ -164,6 +178,9 @@ func (s *Stmt) execBoundResults(os *ODBCStmt) (driver.Result, error) {
 func (s *Stmt) execResults(os *ODBCStmt, rowCount func(api.SQLHSTMT, *api.SQLLEN) api.SQLRETURN, moreResults func(api.SQLHSTMT) api.SQLRETURN) (driver.Result, error) {
 	result := new(Result)
 	for {
+		if !s.c.IsValid() {
+			return nil, errNativeInvalid
+		}
 		var c api.SQLLEN
 		ret, callErr := safeSQLCall("SQLRowCount", func() api.SQLRETURN {
 			return rowCount(os.h, &c)
@@ -194,12 +211,21 @@ func (s *Stmt) execResults(os *ODBCStmt, rowCount func(api.SQLHSTMT, *api.SQLLEN
 }
 
 func (s *Stmt) Query(args []driver.Value) (driver.Rows, error) {
+	args = copyValues(args)
+	return runOwned(context.Background(), s.c, func() (driver.Rows, error) { return s.queryNative(args) })
+}
+
+func (s *Stmt) queryNative(args []driver.Value) (driver.Rows, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.prepareForUse(s.c.PrepareODBCStmt); err != nil {
 		return nil, err
 	}
-	return s.queryStatement(s.os, args)
+	rows, err := s.queryStatement(s.os, args)
+	if err == nil {
+		rows.(*Rows).attachOwner(s.c, context.Background())
+	}
+	return rows, err
 }
 
 // QueryContext executes a prepared query and interrupts its native ODBC
@@ -212,7 +238,8 @@ func (s *Stmt) QueryContext(ctx context.Context, args []driver.NamedValue) (driv
 	if err != nil {
 		return nil, err
 	}
-	return s.queryContext(ctx, dargs)
+	dargs = copyValues(dargs)
+	return runOwned(ctx, s.c, func() (driver.Rows, error) { return s.queryContext(ctx, dargs) })
 }
 
 func (s *Stmt) queryContext(ctx context.Context, args []driver.Value) (driver.Rows, error) {
@@ -233,13 +260,17 @@ func (s *Stmt) queryContext(ctx context.Context, args []driver.Value) (driver.Ro
 	if err := os.bind(args, s.c); err != nil {
 		return nil, err
 	}
-	return runContextOperation(ctx, func() (driver.Rows, error) {
+	rows, err := runContextOperation(ctx, func() (driver.Rows, error) {
 		return s.queryBound(os)
 	}, func() error {
 		return os.Cancel(s.c)
 	}, func(rows driver.Rows) {
-		_ = rows.Close()
+		_ = rows.(*Rows).closeNative()
 	})
+	if err == nil {
+		rows.(*Rows).attachOwner(s.c, ctx)
+	}
+	return rows, err
 }
 
 func (s *Stmt) queryStatement(os *ODBCStmt, args []driver.Value) (driver.Rows, error) {

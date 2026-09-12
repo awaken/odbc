@@ -20,11 +20,12 @@ import (
 // TODO(brainman): see if I could use SQLExecDirect anywhere
 
 type ODBCStmt struct {
-	h           api.SQLHSTMT
-	stats       *handleStats
-	Parameters  []Parameter
-	Cols        []Column
-	retiredCols [][]Column
+	conn       *Conn
+	freeErr    error
+	h          api.SQLHSTMT
+	stats      *handleStats
+	Parameters []Parameter
+	Cols       []Column
 	// locking/lifetime
 	mu            sync.Mutex
 	usedByStmt    bool
@@ -121,10 +122,18 @@ func (c *Conn) allocateODBCStmt(query string) (*ODBCStmt, []uint16, error) {
 		defer releaseHandle(h, c.stats)
 		return nil, nil, err
 	}
-	return &ODBCStmt{h: h, stats: c.stats, usedByStmt: true}, api.StringToUTF16(query), nil
+	s := &ODBCStmt{h: h, stats: c.stats, usedByStmt: true, conn: c}
+	if c.statements == nil {
+		c.statements = make(map[*ODBCStmt]struct{})
+	}
+	c.statements[s] = struct{}{}
+	return s, api.StringToUTF16(query), nil
 }
 
 func (c *Conn) prepareAllocatedODBCStmt(s *ODBCStmt, queryText []uint16) error {
+	if !c.IsValid() {
+		return errNativeInvalid
+	}
 	ret, callErr := safeSQLCall("SQLPrepare", func() api.SQLRETURN {
 		return api.SQLPrepare(s.h, (*api.SQLWCHAR)(unsafe.Pointer(&queryText[0])), api.SQL_NTS)
 	})
@@ -135,7 +144,7 @@ func (c *Conn) prepareAllocatedODBCStmt(s *ODBCStmt, queryText []uint16) error {
 	if IsError(ret) {
 		return c.newError("SQLPrepare", s.h)
 	}
-	ps, err := ExtractParameters(s.h)
+	ps, err := readParameters(s.h, c.IsValid)
 	if err != nil {
 		c.invalidate()
 		return err
@@ -190,24 +199,30 @@ func (s *ODBCStmt) closeByRows() error {
 }
 
 func (s *ODBCStmt) releaseHandle() error {
+	if s.freeErr != nil {
+		return s.freeErr
+	}
 	h := s.h
-	s.h = api.SQLHSTMT(api.SQL_NULL_HSTMT)
+	if h == api.SQLHSTMT(api.SQL_NULL_HSTMT) {
+		return nil
+	}
 	err := releaseHandle(h, s.stats)
 	if err != nil {
 		// Keep every retained Go buffer pinned if the driver manager did not
 		// confirm that the native statement handle was released.
 		retainPinnedStatement(s)
+		s.freeErr = err
 		return err
+	}
+	s.h = api.SQLHSTMT(api.SQL_NULL_HSTMT)
+	if s.conn != nil {
+		delete(s.conn.statements, s)
 	}
 	for i := range s.Parameters {
 		s.Parameters[i].unpin()
 	}
 	unpinColumns(s.Cols)
-	for _, columns := range s.retiredCols {
-		unpinColumns(columns)
-	}
 	s.Cols = nil
-	s.retiredCols = nil
 	releasePinnedStatement(s)
 	return nil
 }
@@ -237,6 +252,9 @@ func (s *ODBCStmt) bind(args []driver.Value, conn *Conn) error {
 		retainPinnedStatement(s)
 	}
 	for i, a := range args {
+		if !conn.IsValid() {
+			return errNativeInvalid
+		}
 		// this could be done in 2 steps:
 		// 1) bind vars right after prepare;
 		// 2) set their (vars) values here;
@@ -250,6 +268,9 @@ func (s *ODBCStmt) bind(args []driver.Value, conn *Conn) error {
 }
 
 func (s *ODBCStmt) execute(conn *Conn) error {
+	if !conn.IsValid() {
+		return errNativeInvalid
+	}
 	if testingIssue5 {
 		time.Sleep(10 * time.Microsecond)
 	}
@@ -271,6 +292,9 @@ func (s *ODBCStmt) execute(conn *Conn) error {
 }
 
 func (s *ODBCStmt) BindColumns(conn *Conn) error {
+	if !conn.IsValid() {
+		return driver.ErrBadConn
+	}
 	// count columns
 	var n api.SQLSMALLINT
 	ret, callErr := safeSQLCall("SQLNumResultCols", func() api.SQLRETURN {
@@ -288,11 +312,27 @@ func (s *ODBCStmt) BindColumns(conn *Conn) error {
 	}
 	// fetch column descriptions
 	if len(s.Cols) > 0 {
-		s.retiredCols = append(s.retiredCols, s.Cols)
+		// Keep old buffers pinned until the driver confirms every binding is
+		// removed, including trailing columns absent from the next result set.
+		ret, callErr := safeSQLCall("SQLFreeStmt(SQL_UNBIND)", func() api.SQLRETURN {
+			return api.SQLFreeStmt(s.h, api.SQL_UNBIND)
+		})
+		if callErr != nil {
+			conn.invalidate()
+			return callErr
+		}
+		if ret != api.SQL_SUCCESS && ret != api.SQL_SUCCESS_WITH_INFO {
+			conn.invalidate()
+			return conn.newError("SQLFreeStmt(SQL_UNBIND)", s.h)
+		}
+		unpinColumns(s.Cols)
 	}
 	s.Cols = make([]Column, n)
 	binding := true
 	for i := range s.Cols {
+		if !conn.IsValid() {
+			return errNativeInvalid
+		}
 		c, err := NewColumn(s.h, i)
 		if err != nil {
 			conn.invalidate()

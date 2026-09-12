@@ -9,13 +9,21 @@ import (
 	"database/sql/driver"
 	"errors"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"time"
 	"unsafe"
 
 	"github.com/alexbrainman/odbc/api"
 )
 
 type Conn struct {
+	driver           *Driver
+	closeTimeout     time.Duration
+	ownerOnce        sync.Once
+	owner            *connOwner
+	statements       map[*ODBCStmt]struct{}
+	connected        bool
 	h                api.SQLHDBC
 	stats            *handleStats
 	tx               *Tx
@@ -27,6 +35,7 @@ var _ driver.ConnPrepareContext = (*Conn)(nil)
 var _ driver.ExecerContext = (*Conn)(nil)
 var _ driver.QueryerContext = (*Conn)(nil)
 var _ driver.Validator = (*Conn)(nil)
+var _ driver.DriverContext = (*Driver)(nil)
 
 var errODBCAttributes = errors.New("malformed ODBC connection string attributes")
 
@@ -92,6 +101,16 @@ func odbcAccessDriver(dsn string) (bool, error) {
 // conflicting duplicate DRIVER attributes and malformed attribute syntax fail
 // before a connection is opened. Attribute validation errors omit dsn values.
 func (d *Driver) Open(dsn string) (driver.Conn, error) {
+	connector, err := d.OpenConnector(dsn)
+	if err != nil {
+		return nil, err
+	}
+	return connector.Connect(context.Background())
+}
+
+// OpenConnector validates dsn without native I/O. Connect owns initialization
+// and connection startup across cancellation of the caller's context.
+func (d *Driver) OpenConnector(dsn string) (driver.Connector, error) {
 	if strings.IndexByte(dsn, 0) >= 0 {
 		return nil, errors.New("ODBC connection string contains a NUL byte")
 	}
@@ -99,8 +118,42 @@ func (d *Driver) Open(dsn string) (driver.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := d.initialize(); err != nil {
+	return &connConnector{driver: d, dsn: dsn, isAccess: isAccess}, nil
+}
+
+type connConnector struct {
+	driver   *Driver
+	dsn      string
+	isAccess bool
+}
+
+func (n *connConnector) Driver() driver.Driver { return n.driver }
+
+func (n *connConnector) Connect(ctx context.Context) (driver.Conn, error) {
+	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if err := n.driver.acquireNativeSlot(); err != nil {
+		return nil, err
+	}
+	c := &Conn{stats: &n.driver.stats, driver: n.driver, closeTimeout: n.driver.CloseTimeout, isMSAccessDriver: n.isAccess}
+	_, err := runNative(ctx, c, func() (struct{}, error) {
+		return struct{}{}, c.openNative(n.dsn)
+	}, true)
+	if err != nil {
+		c.requestClose()
+		return nil, err
+	}
+	return c, nil
+}
+
+func (c *Conn) openNative(dsn string) error {
+	d := c.driver
+	if err := d.initialize(); err != nil {
+		return err
+	}
+	if c.bad.Load() {
+		return errNativeInvalid
 	}
 
 	var out api.SQLHANDLE
@@ -108,46 +161,80 @@ func (d *Driver) Open(dsn string) (driver.Conn, error) {
 		return api.SQLAllocHandle(api.SQL_HANDLE_DBC, api.SQLHANDLE(d.h), &out)
 	})
 	if callErr != nil {
-		return nil, callErr
+		return callErr
 	}
 	if IsError(ret) {
-		return nil, NewError("SQLAllocHandle", d.h)
+		return NewError("SQLAllocHandle", d.h)
 	}
-	h := api.SQLHDBC(out)
+	c.h = api.SQLHDBC(out)
 	d.stats.updateHandleCount(api.SQL_HANDLE_DBC, 1)
+	if c.bad.Load() {
+		return errNativeInvalid
+	}
 
 	b := api.StringToUTF16(dsn)
 	ret, callErr = safeSQLCall("SQLDriverConnect", func() api.SQLRETURN {
-		return api.SQLDriverConnect(h, 0,
+		return api.SQLDriverConnect(c.h, 0,
 			(*api.SQLWCHAR)(unsafe.Pointer(&b[0])), api.SQL_NTS,
 			nil, 0, nil, api.SQL_DRIVER_NOPROMPT)
 	})
 	if callErr != nil {
-		defer releaseHandle(h, &d.stats)
-		return nil, callErr
+		return callErr
 	}
 	if IsError(ret) {
-		defer releaseHandle(h, &d.stats)
-		return nil, NewError("SQLDriverConnect", h)
+		return NewError("SQLDriverConnect", c.h)
 	}
-	return &Conn{h: h, stats: &d.stats, isMSAccessDriver: isAccess}, nil
+	c.connected = true
+	return nil
 }
 
-func (c *Conn) Close() (err error) {
+// Close bounds public waiting; incomplete native work keeps its handles owned.
+func (c *Conn) Close() error {
 	if c.h == api.SQLHDBC(api.SQL_NULL_HDBC) {
 		return nil
 	}
+	o := c.requestClose()
+	select {
+	case <-o.closeDone:
+		return o.closeErr
+	default:
+	}
+	if o.abandoned.Load() {
+		return ErrCleanupPending
+	}
+	timer := time.NewTimer(c.cleanupTimeout())
+	defer timer.Stop()
+	select {
+	case <-o.closeDone:
+		return o.closeErr
+	case <-timer.C:
+		o.abandoned.Store(true)
+		return ErrCleanupPending
+	}
+}
+
+func (c *Conn) closeNative() (err error) {
+	if c.h == api.SQLHDBC(api.SQL_NULL_HDBC) {
+		return nil
+	}
+	if !c.connected {
+		return releaseHandle(c.h, c.stats)
+	}
 	if c.tx != nil {
-		err = c.tx.Rollback()
+		if err = c.endTx(false); err != nil {
+			return err
+		}
+	}
+	for statement := range c.statements {
+		statement.mu.Lock()
+		err = statement.releaseHandle()
+		statement.usedByRows, statement.usedByStmt = false, false
+		statement.mu.Unlock()
+		if err != nil {
+			return err
+		}
 	}
 	h := c.h
-	defer func() {
-		c.h = api.SQLHDBC(api.SQL_NULL_HDBC)
-		e := releaseHandle(h, c.stats)
-		if err == nil {
-			err = e
-		}
-	}()
 	ret, callErr := safeSQLCall("SQLDisconnect", func() api.SQLRETURN {
 		return api.SQLDisconnect(c.h)
 	})
@@ -157,7 +244,7 @@ func (c *Conn) Close() (err error) {
 	if IsError(ret) {
 		return c.newError("SQLDisconnect", h)
 	}
-	return err
+	return releaseHandle(h, c.stats)
 }
 
 // IsValid reports whether the connection can safely return to database/sql's
@@ -185,20 +272,28 @@ func (c *Conn) ExecContext(ctx context.Context, query string, args []driver.Name
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if !c.IsValid() {
-		return nil, driver.ErrBadConn
-	}
 	dargs, err := namedValueToValue(args)
 	if err != nil {
 		return nil, err
 	}
-	statement, err := c.PrepareContext(ctx, query)
+	dargs = copyValues(dargs)
+	return runOwned(ctx, c, func() (driver.Result, error) { return c.execContext(ctx, query, dargs) })
+}
+
+func (c *Conn) execContext(ctx context.Context, query string, dargs []driver.Value) (driver.Result, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !c.IsValid() {
+		return nil, driver.ErrBadConn
+	}
+	statement, err := c.prepareContext(ctx, query)
 	if err != nil {
 		return nil, err
 	}
 	stmt := statement.(*Stmt)
 	result, operationErr := stmt.execContext(ctx, dargs)
-	closeErr := stmt.Close()
+	closeErr := stmt.closeNative()
 	if operationErr != nil {
 		return nil, operationErr
 	}
@@ -214,26 +309,34 @@ func (c *Conn) QueryContext(ctx context.Context, query string, args []driver.Nam
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if !c.IsValid() {
-		return nil, driver.ErrBadConn
-	}
 	dargs, err := namedValueToValue(args)
 	if err != nil {
 		return nil, err
 	}
-	statement, err := c.PrepareContext(ctx, query)
+	dargs = copyValues(dargs)
+	return runOwned(ctx, c, func() (driver.Rows, error) { return c.queryContext(ctx, query, dargs) })
+}
+
+func (c *Conn) queryContext(ctx context.Context, query string, dargs []driver.Value) (driver.Rows, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !c.IsValid() {
+		return nil, driver.ErrBadConn
+	}
+	statement, err := c.prepareContext(ctx, query)
 	if err != nil {
 		return nil, err
 	}
 	stmt := statement.(*Stmt)
 	rows, operationErr := stmt.queryContext(ctx, dargs)
-	closeErr := stmt.Close()
+	closeErr := stmt.closeNative()
 	if operationErr != nil {
 		return nil, operationErr
 	}
 	if closeErr != nil {
 		if rows != nil {
-			_ = rows.Close()
+			_ = rows.(*Rows).closeNative()
 		}
 		return nil, closeErr
 	}

@@ -16,4 +16,7 @@ func TestUnavailableBackendReturnsErrors(t *testing.T) {
 	if ret := SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &handle); ret != SQL_ERROR {
 		t.Fatalf("SQLAllocHandle returned %d; want %d", ret, SQL_ERROR)
 	}
+	if ret := SQLFreeStmt(SQL_NULL_HSTMT, SQL_UNBIND); ret != SQL_ERROR {
+		t.Fatalf("SQLFreeStmt returned %d; want %d", ret, SQL_ERROR)
+	}
 }

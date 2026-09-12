@@ -91,3 +91,22 @@ func TestStmtRowsAffectedValidity(t *testing.T) {
 		})
 	}
 }
+
+func TestStmtStopsResultsAfterInvalidation(t *testing.T) {
+	s := &Stmt{c: &Conn{h: 1}}
+	counts := 0
+	_, err := s.execResults(&ODBCStmt{}, func(_ api.SQLHSTMT, n *api.SQLLEN) api.SQLRETURN {
+		counts++
+		*n = 1
+		return api.SQL_SUCCESS
+	}, func(api.SQLHSTMT) api.SQLRETURN {
+		s.c.invalidate()
+		if counts == 1 {
+			return api.SQL_SUCCESS
+		}
+		return api.SQL_NO_DATA
+	})
+	if err == nil || counts != 1 {
+		t.Fatalf("invalidated result traversal continued: count=%d err=%v", counts, err)
+	}
+}

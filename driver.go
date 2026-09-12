@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/alexbrainman/odbc/api"
 )
@@ -30,11 +31,21 @@ var drv Driver
 
 // Driver implements database/sql/driver.Driver through an ODBC environment.
 type Driver struct {
-	stats    handleStats
-	h        api.SQLHENV // environment handle
-	initOnce sync.Once
-	initErr  error
-	poolMode atomic.Int32
+	// NativeLimit bounds open and quarantined connections. Zero selects 256.
+	// Set this and CloseTimeout before the first Open; do not mutate them later.
+	NativeLimit int `json:"nativeLimit,omitempty" yaml:"nativeLimit,omitempty" xml:"nativeLimit,omitempty"`
+	// CloseTimeout bounds public cleanup waits. Zero selects five seconds.
+	CloseTimeout time.Duration `json:"closeTimeout,omitempty" yaml:"closeTimeout,omitempty" xml:"closeTimeout,omitempty"`
+	nativeMu     sync.Mutex
+	nativeSlots  chan struct{}
+	nativeClosed bool
+	closeDone    chan struct{}
+	closeErr     error
+	stats        handleStats
+	h            api.SQLHENV // environment handle
+	initOnce     sync.Once
+	initErr      error
+	poolMode     atomic.Int32
 }
 
 // Stats returns a synchronized snapshot of the native handles currently owned
@@ -64,16 +75,44 @@ func (d *Driver) setPoolMode(mode DriverPoolMode) {
 
 // Close releases the ODBC environment handle owned by d.
 func (d *Driver) Close() error {
-	// TODO(brainman): who will call (*Driver).Close (to dispose all opened handles)?
+	d.nativeMu.Lock()
+	if len(d.nativeSlots) != 0 {
+		d.nativeMu.Unlock()
+		return ErrCleanupPending
+	}
+	d.nativeClosed = true
 	h := d.h
 	if h == api.SQLHENV(api.SQL_NULL_HENV) {
+		d.nativeMu.Unlock()
 		return nil
 	}
-	if err := releaseHandle(h, &d.stats); err != nil {
-		return err
+	if d.closeDone == nil {
+		d.closeDone = make(chan struct{})
+		go func() {
+			err := releaseHandle(h, &d.stats)
+			d.nativeMu.Lock()
+			d.closeErr = err
+			if err == nil {
+				d.h = api.SQLHENV(api.SQL_NULL_HENV)
+			}
+			close(d.closeDone)
+			d.nativeMu.Unlock()
+		}()
 	}
-	d.h = api.SQLHENV(api.SQL_NULL_HENV)
-	return nil
+	done := d.closeDone
+	wait := d.CloseTimeout
+	if wait <= 0 {
+		wait = DefaultCloseTimeout
+	}
+	d.nativeMu.Unlock()
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return d.closeErr
+	case <-timer.C:
+		return ErrCleanupPending
+	}
 }
 
 func (d *Driver) initialize() error {

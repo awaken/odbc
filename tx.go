@@ -38,7 +38,7 @@ func (c *Conn) setAutoCommitAttr(a uintptr) error {
 }
 
 func (c *Conn) Begin() (driver.Tx, error) {
-	return c.begin()
+	return runOwned(context.Background(), c, c.begin)
 }
 
 // BeginTx starts a transaction after validating ctx and the requested options.
@@ -54,7 +54,7 @@ func (c *Conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, e
 	if opts.ReadOnly {
 		return nil, errors.New("odbc: read-only transactions are not supported")
 	}
-	return c.begin()
+	return runOwned(ctx, c, c.begin)
 }
 
 func (c *Conn) begin() (driver.Tx, error) {
@@ -103,9 +103,25 @@ func (c *Conn) endTx(commit bool) error {
 }
 
 func (tx *Tx) Commit() error {
-	return tx.c.endTx(true)
+	return tx.end(true)
 }
 
 func (tx *Tx) Rollback() error {
-	return tx.c.endTx(false)
+	return tx.end(false)
+}
+
+func (tx *Tx) end(commit bool) error {
+	c := tx.c
+	ctx, cancel := context.WithTimeout(context.Background(), c.cleanupTimeout())
+	defer cancel()
+	_, err := runOwned(ctx, c, func() (struct{}, error) { return struct{}{}, c.endTx(commit) })
+	if errors.Is(err, context.DeadlineExceeded) {
+		c.nativeOwner().abandoned.Store(true)
+		c.requestClose()
+		return ErrCleanupPending
+	}
+	if errors.Is(err, driver.ErrBadConn) {
+		return errNativeInvalid
+	}
+	return err
 }

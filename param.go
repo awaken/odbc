@@ -252,6 +252,13 @@ func (p *Parameter) unpin() {
 // when every SQLDescribeParam diagnostic is IM001, HYC00 or S1C00. Other errors
 // discard partial metadata and propagate to the statement's failure handling.
 func ExtractParameters(h api.SQLHSTMT) ([]Parameter, error) {
+	return readParameters(h, func() bool { return true })
+}
+
+func readParameters(h api.SQLHSTMT, valid func() bool) ([]Parameter, error) {
+	if !valid() {
+		return nil, errNativeInvalid
+	}
 	// count parameters
 	var n api.SQLSMALLINT
 	ret, callErr := safeSQLCall("SQLNumParams", func() api.SQLRETURN {
@@ -264,6 +271,9 @@ func ExtractParameters(h api.SQLHSTMT) ([]Parameter, error) {
 		return nil, NewError("SQLNumParams", h)
 	}
 	return extractParameters(int(n), func(index int, p *Parameter) (api.SQLRETURN, error) {
+		if !valid() {
+			return api.SQL_ERROR, errNativeInvalid
+		}
 		var nullable api.SQLSMALLINT
 		return safeSQLCall("SQLDescribeParam", func() api.SQLRETURN {
 			return api.SQLDescribeParam(h, api.SQLUSMALLINT(index), &p.SQLType, &p.Size, &p.Decimal, &nullable)

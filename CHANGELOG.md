@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.1.1 - 2026-09-12
+
+- Return context cancellation from connection startup, preparation, execution
+  and row iteration while retaining ownership of unfinished native work.
+- Bound public cleanup waits and native connection capacity. Canceled
+  connections cannot return to the pool or replay work already started.
+- Keep row destinations and argument buffers isolated from late native results.
+- Unbind previous result columns before rebinding, including smaller result
+  sets. Retain pinned buffers until native release is confirmed.
+
+Addresses F1183, F1191, F1192 and F1196. `Driver.NativeLimit` defaults to 256
+connections and `Driver.CloseTimeout` to five seconds. Configure both before
+first use. An indefinitely blocked native call retains its capacity until
+process exit. Native driver managers must export `SQLFreeStmt`.
+
 ## v0.1.0 - 2026-09-11
 
 Initial release of Flower's ODBC fork.
