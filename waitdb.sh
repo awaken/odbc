@@ -57,13 +57,13 @@ done
 # Existing databases are success. Creation errors are permanent for this attempt.
 # Transfer the query through an environment variable, never through shell source.
 if [[ "$backend" == mssql ]]; then
-    ODBC_TEST_DB_QUERY="IF DB_ID(N'$DB_NAME') IS NULL CREATE DATABASE [$DB_NAME]"
+    printf -v ODBC_TEST_DB_QUERY "IF DB_ID(N'%s') IS NULL CREATE DATABASE [%s]" "$DB_NAME" "$DB_NAME"
     export ODBC_TEST_DB_QUERY
     capture docker exec -e ODBC_TEST_DB_QUERY "$container" sh -c \
         'SQLCMDPASSWORD="$MSSQL_SA_PASSWORD" /opt/mssql-tools18/bin/sqlcmd -b -S localhost -U SA -Q "$ODBC_TEST_DB_QUERY"' \
         || fail 'database creation failed or timed out'
 else
-    ODBC_TEST_DB_QUERY="CREATE DATABASE IF NOT EXISTS \`$DB_NAME\`"
+    printf -v ODBC_TEST_DB_QUERY 'CREATE DATABASE IF NOT EXISTS `%s`' "$DB_NAME"
     export ODBC_TEST_DB_QUERY
     capture docker exec -e ODBC_TEST_DB_QUERY "$container" sh -c \
         'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql -hlocalhost -uroot -e "$ODBC_TEST_DB_QUERY"' \

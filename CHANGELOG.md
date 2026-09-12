@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## v0.1.4 - 2026-09-12
+
+- Build SQL Server and MySQL startup queries with explicit format strings.
+  Database-name validation and readiness behavior remain unchanged.
+
 ## v0.1.3 - 2026-09-12
 
 - Remove Microsoft Access support, its integration test and the `go-ole` COM
