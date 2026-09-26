@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -125,4 +126,239 @@ func TestExtractParameterCallErrors(t *testing.T) {
 	if params != nil || err != nil {
 		t.Fatalf("no parameters: %v, %v", params, err)
 	}
+}
+
+// Operation numbers match the owned native fixture.
+const (
+	nativeAlloc = iota + 1
+	nativePrepare
+	nativeExecute
+	nativeFetch
+	nativeMore
+	nativeCancel
+	nativeCursor
+	nativeFree
+	nativeDisconnect
+	nativeEndTran
+	nativeAutocommit
+	nativeUnbind
+	nativeDescribe
+	nativeBind
+	nativeNumCols
+	nativeGetData
+	nativeConnect
+)
+
+// auditODBC is supplied only by the Linux owned-fixture tests.
+type auditODBC struct {
+	conn   *Conn
+	stmt   *ODBCStmt
+	set    func(int32, int64)
+	get    func(int32) int64
+	mode   func(int32, int32)
+	calls  func(int32) int32
+	active func(int32) int32
+	cols   func(int32)
+}
+
+func (f *auditODBC) waitActive(t *testing.T, op int32) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for f.active(op) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("operation %d did not start", op)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+var auditOpenODBC func(*testing.T) *auditODBC
+
+// Supplied only by the test overlay; ordinary builds keep native calls intact.
+var auditWrapSQL func(string, func()) (func(), error)
+
+func auditCallPanic(t *testing.T, name string, nth int32) func() {
+	t.Helper()
+	if auditWrapSQL == nil {
+		t.Skip("test-only native injection overlay not selected")
+	}
+	var calls atomic.Int32
+	restore, err := auditWrapSQL(name, func() {
+		if calls.Add(1) == nth {
+			panic("owned audit native failure")
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return restore
+}
+
+func auditNative(t *testing.T) *auditODBC {
+	t.Helper()
+	if auditOpenODBC == nil {
+		t.Skip("owned audit native fixture is unavailable on this target")
+	}
+	return auditOpenODBC(t)
+}
+
+// auditWaitClose verifies that invalidation eventually releases native children.
+func auditWaitClose(t *testing.T, c *Conn) {
+	t.Helper()
+	select {
+	case <-c.nativeOwner().closeDone:
+		if err := c.nativeOwner().closeErr; err != nil {
+			t.Fatalf("native cleanup: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("native cleanup did not finish")
+	}
+	if s := c.driver.Stats(); s.ConnCount != 0 || s.StmtCount != 0 {
+		t.Fatalf("native children retained after cleanup: %+v", s)
+	}
+}
+
+func TestAuditParameterNullBytes(t *testing.T) {
+	f := auditNative(t)
+	f.stmt.Parameters = make([]Parameter, 1)
+	p := &f.stmt.Parameters[0]
+	for _, tc := range []struct {
+		name   string
+		value  any
+		length int64
+	}{
+		{"nil", nil, int64(api.SQL_NULL_DATA)},
+		{"typed nil bytes", []byte(nil), int64(api.SQL_NULL_DATA)},
+		{"empty bytes", []byte{}, 0},
+		{"binary bytes", []byte{0, 1, 0}, 3},
+		{"empty text", "", 0},
+		{"embedded NUL text", "a\x00b", 6},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := p.BindValue(f.stmt.h, 0, tc.value, f.conn); err != nil {
+				t.Fatal(err)
+			}
+			if got := f.get(5); got != tc.length {
+				t.Errorf("native length indicator=%d; want %d", got, tc.length)
+			}
+		})
+	}
+}
+
+func TestAuditParameterTimestampScale(t *testing.T) {
+	f := auditNative(t)
+	f.stmt.Parameters = make([]Parameter, 1)
+	p := &f.stmt.Parameters[0]
+	for _, scale := range []int16{0, 3, 7, 9} {
+		p.isDescribed, p.SQLType, p.Decimal = true, api.SQL_TYPE_TIMESTAMP, api.SQLSMALLINT(scale)
+		value := time.Date(2026, 9, 26, 12, 30, 0, 0, time.UTC)
+		if err := p.BindValue(f.stmt.h, 0, value, f.conn); err != nil {
+			t.Fatal(err)
+		}
+		if got := f.get(6); got != int64(scale) {
+			t.Errorf("described timestamp scale %d changed to %d", scale, got)
+		}
+	}
+}
+
+func TestAuditNegativeParameterCount(t *testing.T) {
+	params, err := extractParameters(-1, func(int, *Parameter) (api.SQLRETURN, error) {
+		t.Fatal("invalid metadata must not describe parameters")
+		return api.SQL_ERROR, nil
+	}, nil)
+	if err == nil || params != nil {
+		t.Errorf("invalid native parameter count was accepted: params=%v error=%v", params, err)
+	}
+}
+
+func TestAuditParameterTypeBindings(t *testing.T) {
+	f := auditNative(t)
+	f.stmt.Parameters = make([]Parameter, 1)
+	p := &f.stmt.Parameters[0]
+	for _, tc := range []struct {
+		value any
+		ctype api.SQLSMALLINT
+	}{
+		{int64(42), api.SQL_C_LONG},
+		{int64(1) << 40, api.SQL_C_SBIGINT},
+		{false, api.SQL_C_BIT}, {true, api.SQL_C_BIT},
+		{float64(1.25), api.SQL_C_DOUBLE},
+		{time.Date(2026, 9, 26, 10, 20, 30, 123000000, time.UTC), api.SQL_C_TYPE_TIMESTAMP},
+		{"ab", api.SQL_C_WCHAR}, {strings.Repeat("x", 4000), api.SQL_C_WCHAR},
+		{make([]byte, 8000), api.SQL_C_BINARY},
+	} {
+		if err := p.BindValue(f.stmt.h, 0, tc.value, f.conn); err != nil {
+			t.Fatal(err)
+		}
+		if got := f.get(8); got != int64(tc.ctype) {
+			t.Errorf("%T bound as %d; want %d", tc.value, got, tc.ctype)
+		}
+	}
+	p.isDescribed, p.SQLType = true, api.SQL_VARBINARY
+	if err := p.BindValue(f.stmt.h, 0, []byte{1}, f.conn); err != nil || f.get(9) != int64(api.SQL_VARBINARY) {
+		t.Fatalf("described binary: %v", err)
+	}
+	p.SQLType = api.SQL_VARCHAR
+	if err := p.BindValue(f.stmt.h, 0, "abc", f.conn); err != nil || f.get(9) != int64(api.SQL_VARCHAR) {
+		t.Fatalf("described text: %v", err)
+	}
+	old := p.pinner
+	f.set(10, 1)
+	if err := p.BindValue(f.stmt.h, 0, "retry", f.conn); err == nil || len(p.retiredPinners) != 1 || p.retiredPinners[0] != old {
+		t.Fatalf("failed binding lost old native ownership: %v", err)
+	}
+	f.set(10, 0)
+	if err := p.BindValue(f.stmt.h, 0, "success", f.conn); err != nil || len(p.retiredPinners) != 0 {
+		t.Fatalf("successful replacement retained old binding: %v", err)
+	}
+	if err := p.BindValue(f.stmt.h, 0, struct{}{}, f.conn); err == nil {
+		t.Error("unsupported input accepted")
+	}
+	if ptr := p.StoreStrLen_or_IndPtr(5); *ptr != 5 {
+		t.Error("indicator store failed")
+	}
+}
+
+// Metadata failures must not publish a partly described parameter list.
+func TestAuditParameterMetadataFailures(t *testing.T) {
+	f := auditNative(t)
+	f.set(2, 1)
+	params, err := ExtractParameters(f.stmt.h)
+	if err != nil || len(params) != 1 || !params[0].isDescribed {
+		t.Fatalf("valid metadata: %v, %v", params, err)
+	}
+	f.set(13, int64(api.SQL_ERROR))
+	if _, err := ExtractParameters(f.stmt.h); err == nil {
+		t.Error("parameter-count failure was ignored")
+	}
+	f.set(13, 0)
+	f.set(14, int64(api.SQL_ERROR))
+	if _, err := ExtractParameters(f.stmt.h); err == nil {
+		t.Error("parameter-description failure was ignored")
+	}
+	f.set(14, 0)
+	checks := 0
+	_, err = readParameters(f.stmt.h, func() bool { checks++; return checks == 1 })
+	if !errors.Is(err, errNativeInvalid) {
+		t.Fatalf("invalidation between metadata calls: %v", err)
+	}
+	for _, kind := range []api.SQLSMALLINT{api.SQL_VARCHAR, api.SQL_WVARCHAR} {
+		params, err := extractParameters(1, func(_ int, p *Parameter) (api.SQLRETURN, error) {
+			p.SQLType = kind
+			return api.SQL_SUCCESS, nil
+		}, nil)
+		want := api.SQL_LONGVARCHAR
+		if kind == api.SQL_WVARCHAR {
+			want = api.SQL_WLONGVARCHAR
+		}
+		if err != nil || len(params) != 1 || params[0].SQLType != api.SQLSMALLINT(want) {
+			t.Fatalf("unbounded text metadata: %v, %v", params, err)
+		}
+	}
+	f.stmt.Parameters = make([]Parameter, 1)
+	f.set(10, 1)
+	if err := f.stmt.Parameters[0].BindValue(f.stmt.h, 0, "first binding fails", f.conn); err == nil {
+		t.Error("first binding failure was ignored")
+	}
+	f.set(10, 0)
 }

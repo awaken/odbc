@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## v0.1.5 - 2026-09-26
+
+- Preserve NULL binary parameters and explicit zero timestamp scale.
+- Prevent multibyte text truncation and reject invalid parameter metadata.
+- Traverse update-count results without losing cancellation or native errors.
+- Expose DBMS information and catalog metadata on supported native backends,
+  with safe unavailable-platform stubs.
+- Keep optional integration cleanup optional when statement preparation fails.
+- Update `purego` to v0.11.1.
+
 ## v0.1.4 - 2026-09-12
 
 - Build SQL Server and MySQL startup queries with explicit format strings.

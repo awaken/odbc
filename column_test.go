@@ -8,11 +8,14 @@ import (
 	"context"
 	"database/sql/driver"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf16"
 	"unsafe"
 
 	"github.com/alexbrainman/odbc/api"
@@ -20,6 +23,96 @@ import (
 
 func bytesOf[T any](value *T) []byte {
 	return unsafe.Slice((*byte)(unsafe.Pointer(value)), int(unsafe.Sizeof(*value)))
+}
+
+func TestAuditColumnRetryFailures(t *testing.T) {
+	f := auditNative(t)
+	for _, mode := range []string{"call", "native", "length", "changed length"} {
+		calls := 0
+		_, err := newColumn(f.stmt.h, 0, func(api.SQLHSTMT, int, []uint16) (int, api.SQLSMALLINT, api.SQLULEN, api.SQLRETURN, error) {
+			calls++
+			if calls == 1 {
+				return 200, api.SQL_VARCHAR, 4, api.SQL_SUCCESS_WITH_INFO, nil
+			}
+			switch mode {
+			case "call":
+				return 0, 0, 0, 0, context.Canceled
+			case "native":
+				return 0, 0, 0, api.SQL_ERROR, nil
+			case "changed length":
+				return 201, api.SQL_VARCHAR, 4, api.SQL_SUCCESS_WITH_INFO, nil
+			default:
+				return -1, 0, 0, api.SQL_SUCCESS, nil
+			}
+		})
+		if err == nil || calls != 2 {
+			t.Fatalf("%s retry: calls=%d, err=%v", mode, calls, err)
+		}
+	}
+}
+
+func TestAuditUnboundColumnErrors(t *testing.T) {
+	f := auditNative(t)
+	column := NewBindableColumn(&BaseColumn{}, api.SQL_C_CHAR, 8)
+	column.IsVariableWidth = true
+	for _, mode := range []int64{2, 3, 5, 6} {
+		f.set(12, mode)
+		value, err := column.Value(f.stmt.h, 0)
+		if mode == 2 && (value != nil || err != nil) {
+			t.Fatalf("NULL: %v, %v", value, err)
+		}
+		if mode == 3 && (err != nil || len(value.([]byte)) != 0) {
+			t.Fatalf("empty text: %v, %v", value, err)
+		}
+		if mode >= 5 && err == nil {
+			t.Errorf("invalid indicator mode %d accepted", mode)
+		}
+	}
+	column.IsBound = true
+	if _, err := column.Value(f.stmt.h, 0); err == nil {
+		t.Error("bound column without an indicator accepted")
+	}
+	column.IsVariableWidth = false
+	length := BufferLen(1)
+	column.boundLen = &length
+	if _, err := column.Value(f.stmt.h, 0); err == nil {
+		t.Error("short fixed-width value accepted")
+	}
+}
+
+func TestAuditChunkedColumnDiagnostics(t *testing.T) {
+	f := auditNative(t)
+	column := &NonBindableColumn{BaseColumn: &BaseColumn{CType: api.SQL_C_CHAR}}
+	if bound, err := column.Bind(f.stmt.h, 0); bound || err != nil {
+		t.Fatalf("unbounded column unexpectedly bound: %t, %v", bound, err)
+	}
+	for _, mode := range []int64{7, 8} {
+		f.set(12, mode)
+		value, err := column.Value(f.stmt.h, 0)
+		if mode == 7 && (value != nil || err != nil) {
+			t.Fatalf("NULL with warning: %v, %v", value, err)
+		}
+		if mode == 8 && err == nil {
+			t.Error("negative length with warning accepted")
+		}
+	}
+	f.set(12, 4)
+	for _, diagnostic := range []int64{1, 2, 3} {
+		f.set(16, diagnostic)
+		if _, err := column.Value(f.stmt.h, 0); err == nil {
+			t.Errorf("diagnostic failure mode %d accepted", diagnostic)
+		}
+		// Start each stream at its first chunk.
+		if err := f.stmt.Exec(nil, f.conn); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.set(16, 0)
+	column.CType = api.SQL_C_WCHAR
+	value, err := column.Value(f.stmt.h, 0)
+	if err != nil || len([]rune(string(value.([]byte)))) != 1025 {
+		t.Fatalf("chunked wide value: %v, %v", value, err)
+	}
 }
 
 func TestBaseColumnValueRejectsInvalidBuffers(t *testing.T) {
@@ -153,6 +246,18 @@ func TestColumnBufferPointerAndEmptyBindBuffer(t *testing.T) {
 	column := &BindableColumn{BaseColumn: new(BaseColumn)}
 	if bound, err := column.Bind(0, 2); err == nil || bound {
 		t.Fatalf("Bind with empty buffer = %t, %v; want false and an error", bound, err)
+	}
+	for _, tc := range []struct {
+		ctype api.SQLSMALLINT
+		size  int
+	}{{api.SQL_C_CHAR, 5}, {api.SQL_C_WCHAR, 10}} {
+		column, err := NewVariableWidthColumn(&BaseColumn{}, tc.ctype, 4)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := column.(*BindableColumn).Size; got != tc.size {
+			t.Errorf("ctype %d buffer size = %d; want %d", tc.ctype, got, tc.size)
+		}
 	}
 }
 
@@ -308,5 +413,134 @@ func TestNonBindableColumnPreservesEmptyValue(t *testing.T) {
 	}
 	if values[1] != nil {
 		t.Fatalf("NULL text = %#v; want nil", values[1])
+	}
+}
+
+func TestAuditMultibyteTextRoundTrip(t *testing.T) {
+	f := auditNative(t)
+	f.set(0, int64(api.SQL_VARCHAR))
+	f.set(1, 4) // Four characters occupy eight UTF-8 bytes.
+	f.set(12, 1)
+	rows, err := f.conn.QueryContext(context.Background(), "owned four-character text fixture", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	values := make([]driver.Value, 1)
+	if err := rows.Next(values); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := values[0].([]byte)
+	if !ok || string(got) != "éééé" {
+		t.Errorf("text bytes=%q (%T); want complete UTF-8 text %q", values[0], values[0], "éééé")
+	}
+}
+
+func TestAuditColumnConversions(t *testing.T) {
+	for _, tc := range []struct {
+		ctype   api.SQLSMALLINT
+		sqltype api.SQLSMALLINT
+		data    []byte
+		want    any
+	}{
+		{api.SQL_C_BIT, 0, []byte{1}, true},
+		{api.SQL_C_LONG, 0, bytesOf(new(int32)), int32(0)},
+		{api.SQL_C_SBIGINT, 0, bytesOf(new(int64)), int64(0)},
+		{api.SQL_C_DOUBLE, 0, bytesOf(new(float64)), float64(0)},
+		{api.SQL_C_BINARY, 0, []byte{0, 1}, []byte{0, 1}},
+		{api.SQL_C_CHAR, 0, []byte("abc"), []byte("abc")},
+		{api.SQL_C_WCHAR, 0, []byte{}, []byte{}},
+		{api.SQL_C_GUID, 0, bytesOf(&api.SQLGUID{Data1: 0x01234567, Data2: 0x89ab, Data3: 0xcdef, Data4: [8]byte{1, 2, 3, 4, 5, 6, 7, 8}}), "01234567-89ab-cdef-0102-030405060708"},
+		{api.SQL_C_DATE, 0, bytesOf(&api.SQL_DATE_STRUCT{Year: 2024, Month: 2, Day: 29}), time.Date(2024, 2, 29, 0, 0, 0, 0, time.Local)},
+	} {
+		got, err := (&BaseColumn{CType: tc.ctype, SQLType: tc.sqltype}).Value(tc.data)
+		if err != nil || !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("C type %d: got=%v want=%v err=%v", tc.ctype, got, tc.want, err)
+		}
+	}
+	if _, err := (&BaseColumn{CType: -999}).Value(nil); err == nil {
+		t.Error("unsupported C type accepted")
+	}
+	for _, data := range [][]uint16{{0xd83d, 0xde00}, {0xd800}, {0xdc00}, {0xd800, 'x'}} {
+		if got, want := string(utf16toutf8(data)), string(utf16.Decode(data)); got != want {
+			t.Errorf("UTF-16=%x got=%q want=%q", data, got, want)
+		}
+	}
+	if err := validateODBCTime(0, -1, 0, 0); err == nil {
+		t.Error("invalid minute accepted")
+	}
+	if err := validateColumnNameLength(maxColumnNameLength + 1); err == nil {
+		t.Error("oversized column name accepted")
+	}
+}
+
+func TestAuditColumnTypeMetadata(t *testing.T) {
+	for _, typ := range []api.SQLSMALLINT{api.SQL_BIT, api.SQL_TINYINT, api.SQL_SMALLINT, api.SQL_INTEGER, api.SQL_BIGINT, api.SQL_NUMERIC, api.SQL_DECIMAL, api.SQL_FLOAT, api.SQL_REAL, api.SQL_DOUBLE, api.SQL_TYPE_TIMESTAMP, api.SQL_TYPE_DATE, api.SQL_TYPE_TIME, api.SQL_SS_TIME2, api.SQL_GUID, api.SQL_CHAR, api.SQL_VARCHAR, api.SQL_WCHAR, api.SQL_WVARCHAR, api.SQL_BINARY, api.SQL_VARBINARY, api.SQL_LONGVARCHAR, api.SQL_WLONGVARCHAR, api.SQL_SS_XML, api.SQL_LONGVARBINARY, -999} {
+		col, err := newColumn(0, 0, func(_ api.SQLHSTMT, _ int, name []uint16) (int, api.SQLSMALLINT, api.SQLULEN, api.SQLRETURN, error) {
+			copy(name, []uint16{'x', 0})
+			return 1, typ, 12, api.SQL_SUCCESS, nil
+		})
+		if typ == -999 {
+			if err == nil {
+				t.Error("unknown SQL type accepted")
+			}
+			continue
+		}
+		if err != nil || col.Name() != "x" {
+			t.Errorf("SQL type %d: column=%v error=%v", typ, col, err)
+		}
+	}
+	if _, err := NewVariableWidthColumn(&BaseColumn{}, -999, 1); err == nil {
+		t.Error("unknown variable-width C type accepted")
+	}
+	for _, retry := range []bool{false, true} {
+		calls := 0
+		_, err := newColumn(0, 0, func(_ api.SQLHSTMT, _ int, name []uint16) (int, api.SQLSMALLINT, api.SQLULEN, api.SQLRETURN, error) {
+			calls++
+			if retry && calls == 1 {
+				return 200, api.SQL_VARCHAR, 1, api.SQL_SUCCESS_WITH_INFO, nil
+			}
+			return 0, 0, 0, api.SQL_ERROR, errors.New("owned description failure")
+		})
+		if err == nil {
+			t.Error("description failure accepted")
+		}
+	}
+}
+
+func TestAuditVariableWidthReads(t *testing.T) {
+	for _, mode := range []int64{1, 2, 3, 4, 5, 6} {
+		t.Run(fmt.Sprint(mode), func(t *testing.T) {
+			f := auditNative(t)
+			f.set(12, mode)
+			col := &NonBindableColumn{&BaseColumn{CType: api.SQL_C_CHAR}}
+			value, err := col.Value(f.stmt.h, 0)
+			if mode >= 5 {
+				if err == nil {
+					t.Error("invalid native length accepted")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if mode == 2 {
+				if value != nil {
+					t.Errorf("NULL became %v", value)
+				}
+				return
+			}
+			want := "éééé"
+			if mode == 3 {
+				want = ""
+			}
+			if mode == 4 {
+				want = strings.Repeat("x", 2050)
+			}
+			data, ok := value.([]byte)
+			if !ok || data == nil || string(data) != want {
+				t.Errorf("mode %d read %v; want %q", mode, value, want)
+			}
+		})
 	}
 }

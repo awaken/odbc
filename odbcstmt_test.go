@@ -11,7 +11,9 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
+	"io"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -30,25 +32,104 @@ type nativeFixture struct {
 	reset      func()
 }
 
-const (
-	nativeAlloc = iota + 1
-	nativePrepare
-	nativeExecute
-	nativeFetch
-	nativeMore
-	nativeCancel
-	nativeCursor
-	nativeFree
-	nativeDisconnect
-	nativeEndTran
-	nativeAutocommit
-	nativeUnbind
-	nativeDescribe
-	nativeBind
-	nativeNumCols
-	nativeGetData
-	nativeConnect
-)
+func TestAuditNativePanicGuards(t *testing.T) {
+	for _, tc := range []struct {
+		name, call string
+		setup      func(*testing.T, *auditODBC)
+		run        func(*auditODBC) error
+		invalid    bool
+	}{
+		{"allocate", "SQLAllocHandle", nil, func(f *auditODBC) error { _, err := f.conn.PrepareODBCStmt("fixture"); return err }, true},
+		{"prepare", "SQLPrepare", nil, func(f *auditODBC) error { _, err := f.conn.PrepareODBCStmt("fixture"); return err }, true},
+		{"execute", "SQLExecute", nil, func(f *auditODBC) error { return f.stmt.execute(f.conn) }, true},
+		{"count columns", "SQLNumResultCols", nil, func(f *auditODBC) error { return f.stmt.BindColumns(f.conn) }, true},
+		{"unbind", "SQLFreeStmt", func(t *testing.T, f *auditODBC) {
+			if err := f.stmt.BindColumns(f.conn); err != nil {
+				t.Fatal(err)
+			}
+		}, func(f *auditODBC) error { return f.stmt.BindColumns(f.conn) }, true},
+		{"cancel", "SQLCancel", nil, func(f *auditODBC) error { return f.stmt.Cancel(f.conn) }, true},
+		{"fetch", "SQLFetch", nil, func(f *auditODBC) error { return (&odbcRows{os: f.stmt, c: f.conn}).Next(nil) }, true},
+		{"advance", "SQLMoreResults", nil, func(f *auditODBC) error { return (&odbcRows{os: f.stmt, c: f.conn}).Advance() }, true},
+		{"skip update count", "SQLMoreResults", func(_ *testing.T, f *auditODBC) { f.cols(0) }, func(f *auditODBC) error { return f.stmt.BindColumns(f.conn) }, true},
+		{"autocommit", "SQLSetConnectAttr", nil, func(f *auditODBC) error { _, err := f.conn.begin(); return err }, true},
+		{"transaction", "SQLEndTran", func(t *testing.T, f *auditODBC) {
+			if _, err := f.conn.begin(); err != nil {
+				t.Fatal(err)
+			}
+		}, func(f *auditODBC) error { return f.conn.endTx(true) }, true},
+		{"diagnostics", "SQLGetDiagRec", nil, func(f *auditODBC) error { return f.conn.newError("fixture", f.conn.h) }, false},
+		{"bind parameter", "SQLBindParameter", func(t *testing.T, f *auditODBC) {
+			f.stmt.Parameters = make([]Parameter, 1)
+			if err := f.stmt.bind([]driver.Value{"old"}, f.conn); err != nil {
+				t.Fatal(err)
+			}
+		}, func(f *auditODBC) error { return f.stmt.bind([]driver.Value{"replacement"}, f.conn) }, true},
+		{"count parameters", "SQLNumParams", nil, func(f *auditODBC) error { _, err := f.conn.PrepareODBCStmt("fixture"); return err }, true},
+		{"bind column", "SQLBindCol", nil, func(f *auditODBC) error { return f.stmt.BindColumns(f.conn) }, true},
+		{"metadata information", "SQLGetInfo", nil, func(f *auditODBC) error { _, err := f.conn.Info(context.Background()); return err }, true},
+		{"metadata catalog", "SQLTables", nil, func(f *auditODBC) error {
+			_, err := f.conn.Catalog(context.Background(), CatalogTables, CatalogFilter{})
+			return err
+		}, true},
+		{"fixed data", "SQLGetData", nil, func(f *auditODBC) error {
+			c := NewBindableColumn(&BaseColumn{}, api.SQL_C_LONG, 4)
+			_, err := c.Value(f.stmt.h, 0)
+			return err
+		}, false},
+		{"variable data", "SQLGetData", nil, func(f *auditODBC) error {
+			c := &NonBindableColumn{BaseColumn: &BaseColumn{CType: api.SQL_C_CHAR}}
+			_, err := c.Value(f.stmt.h, 0)
+			return err
+		}, false},
+		{"cursor close", "SQLCloseCursor", func(_ *testing.T, f *auditODBC) { f.stmt.markUsedByRows() }, func(f *auditODBC) error {
+			return (&odbcRows{os: f.stmt, c: f.conn}).Close()
+		}, true},
+		{"disconnect", "SQLDisconnect", nil, func(f *auditODBC) error { return f.conn.closeNative() }, false},
+		{"free handle", "SQLFreeHandle", nil, func(f *auditODBC) error { return releaseHandle(f.stmt.h, f.stmt.stats) }, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := auditNative(t)
+			if tc.setup != nil {
+				tc.setup(t, f)
+			}
+			restore := auditCallPanic(t, tc.call, 1)
+			defer restore()
+			err := tc.run(f)
+			if err == nil || !strings.Contains(err.Error(), "owned audit native failure") || f.conn.IsValid() == tc.invalid {
+				t.Errorf("native panic: error=%v valid=%v; want invalid=%v", err, f.conn.IsValid(), tc.invalid)
+			}
+			if tc.name == "bind parameter" && len(f.stmt.Parameters[0].retiredPinners) != 1 {
+				t.Error("failed rebinding released the previous native buffer")
+			}
+			// The injected panic happened before entering C. Cleanup can safely
+			// call the original fixture while the one-shot wrapper remains installed.
+			if err := f.conn.Close(); err != nil && !errors.Is(err, ErrCleanupPending) {
+				t.Fatal(err)
+			}
+			auditWaitClose(t, f.conn)
+		})
+	}
+}
+
+func TestAuditInvalidStatementWork(t *testing.T) {
+	f := auditNative(t)
+	f.stmt.Parameters = make([]Parameter, 1)
+	f.conn.invalidate()
+	if err := f.stmt.bind([]driver.Value{"owned"}, f.conn); !errors.Is(err, errNativeInvalid) {
+		t.Fatalf("binding on invalid connection: %v", err)
+	}
+	if err := f.stmt.execute(f.conn); !errors.Is(err, errNativeInvalid) {
+		t.Fatalf("execution on invalid connection: %v", err)
+	}
+	if p := &f.stmt.Parameters[0]; p.Data != nil || p.pinner != nil {
+		t.Fatal("invalid connection acquired parameter buffers")
+	}
+	if err := f.conn.Close(); err != nil && !errors.Is(err, ErrCleanupPending) {
+		t.Fatal(err)
+	}
+	auditWaitClose(t, f.conn)
+}
 
 func openNativeFixture(t *testing.T) *nativeFixture {
 	t.Helper()
@@ -726,6 +807,283 @@ func TestODBCNativeCloseBound(t *testing.T) {
 			f.mode(op, 0)
 			if !returned {
 				<-done
+			}
+		})
+	}
+}
+
+func init() {
+	auditOpenODBC = func(t *testing.T) *auditODBC {
+		t.Helper()
+		f := openNativeFixture(t)
+		h, err := purego.Dlopen(os.Getenv("FLOWER_ODBC_TEST_LIBRARY"), purego.RTLD_NOW|purego.RTLD_LOCAL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = purego.Dlclose(h) })
+		if _, err := purego.Dlsym(h, "AuditSet"); err != nil {
+			t.Skip("audit extension of owned fixture was not selected")
+		}
+		a := &auditODBC{conn: f.connection(t), mode: f.mode, calls: f.calls, active: f.active, cols: f.columns}
+		purego.RegisterLibFunc(&a.set, h, "AuditSet")
+		purego.RegisterLibFunc(&a.get, h, "AuditGet")
+		raw, err := a.conn.Prepare("owned audit fixture")
+		if err != nil {
+			t.Fatal(err)
+		}
+		a.stmt = raw.(*Stmt).os
+		t.Cleanup(func() { _ = raw.Close() })
+		return a
+	}
+}
+
+// A failed native operation must propagate and leave reusable statements usable.
+func TestAuditStatementNativeFailures(t *testing.T) {
+	for _, op := range []int32{nativeAlloc, nativePrepare, nativeExecute, nativeNumCols, nativeMore} {
+		name := map[int32]string{nativeAlloc: "allocate", nativePrepare: "prepare", nativeExecute: "execute", nativeNumCols: "column count", nativeMore: "more results"}[op]
+		t.Run(name, func(t *testing.T) {
+			f := openNativeFixture(t)
+			c := f.connection(t)
+			t.Cleanup(func() { f.mode(op, 0) })
+			if op == nativeAlloc || op == nativePrepare {
+				f.mode(op, 2)
+				if _, err := c.Prepare("owned failure"); err == nil {
+					t.Fatal("prepare failure was ignored")
+				}
+				if _, err := c.PrepareContext(context.Background(), "owned failure"); err == nil {
+					t.Fatal("context prepare failure was ignored")
+				}
+				if _, err := c.ExecContext(context.Background(), "owned failure", nil); err == nil {
+					t.Fatal("connection execution ignored prepare failure")
+				}
+				if _, err := c.QueryContext(context.Background(), "owned failure", nil); err == nil {
+					t.Fatal("connection query ignored prepare failure")
+				}
+				return
+			}
+			raw, err := c.Prepare("owned failure")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer raw.Close()
+			stmt := raw.(*Stmt)
+			f.mode(op, 2)
+			if op != nativeNumCols {
+				if _, err := stmt.Exec(nil); err == nil {
+					t.Error("native execution failure was ignored")
+				}
+				if _, err := stmt.ExecContext(context.Background(), nil); err == nil {
+					t.Error("context execution failure was ignored")
+				}
+			}
+			if op != nativeMore {
+				if _, err := stmt.Query(nil); err == nil {
+					t.Error("native query failure was ignored")
+				}
+				if _, err := stmt.QueryContext(context.Background(), nil); err == nil {
+					t.Error("context query failure was ignored")
+				}
+			}
+			f.mode(op, 0)
+			result, err := stmt.Exec(nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if count, err := result.RowsAffected(); err != nil || count != 1 {
+				t.Fatalf("recovery result: %d, %v", count, err)
+			}
+		})
+	}
+}
+
+func TestAuditStatementReusedWithRows(t *testing.T) {
+	f := auditNative(t)
+	raw, err := f.conn.Prepare("owned reusable statement")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	stmt := raw.(*Stmt)
+	for _, withContext := range []bool{false, true} {
+		rows, err := stmt.Query(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		old := stmt.os
+		if withContext {
+			_, err = stmt.ExecContext(context.Background(), nil)
+		} else {
+			_, err = stmt.Exec(nil)
+		}
+		if err != nil || stmt.os == old {
+			t.Fatalf("reuse retained an active row handle: %v", err)
+		}
+		values := make([]driver.Value, 1)
+		if err := rows.Next(values); err != nil || values[0] != int32(42) {
+			t.Fatalf("old cursor lost its row: %v, %v", values, err)
+		}
+		if err := rows.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := stmt.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stmt.Exec(nil); err == nil {
+		t.Error("closed statement executed")
+	}
+	if _, err := stmt.Query(nil); err == nil {
+		t.Error("closed statement queried")
+	}
+}
+
+func TestAuditBindingAndFetchFailures(t *testing.T) {
+	f := auditNative(t)
+	if err := f.stmt.Exec([]driver.Value{1}, f.conn); err == nil {
+		t.Error("unexpected arguments accepted")
+	}
+	f.stmt.Parameters = make([]Parameter, 1)
+	if err := f.stmt.Exec([]driver.Value{struct{}{}}, f.conn); err == nil {
+		t.Error("unsupported argument accepted")
+	}
+	if err := f.stmt.Exec([]driver.Value{int64(7)}, f.conn); err != nil {
+		t.Fatal(err)
+	}
+	f.set(15, int64(api.SQL_NO_DATA))
+	if err := f.stmt.Exec([]driver.Value{int64(7)}, f.conn); err != nil {
+		t.Fatalf("empty execution: %v", err)
+	}
+	f.set(15, 0)
+	f.set(0, int64(api.SQL_LONGVARBINARY))
+	f.cols(2)
+	if err := f.stmt.BindColumns(f.conn); err != nil {
+		t.Fatal(err)
+	}
+	for _, col := range f.stmt.Cols {
+		if _, ok := col.(*NonBindableColumn); !ok {
+			t.Fatal("unbounded result was bound")
+		}
+	}
+	f.mode(nativeGetData, 2)
+	if _, err := f.stmt.Cols[0].Value(f.stmt.h, 0); err == nil {
+		t.Error("get-data failure was ignored")
+	}
+	bound := NewBindableColumn(&BaseColumn{}, api.SQL_C_LONG, 4)
+	if _, err := bound.Value(f.stmt.h, 0); err == nil {
+		t.Error("unbound fixed get-data failure was ignored")
+	}
+	f.mode(nativeGetData, 0)
+	cursor := &odbcRows{os: f.stmt, c: f.conn}
+	f.mode(nativeFetch, 2)
+	if err := cursor.Next(make([]driver.Value, 2)); err == nil {
+		t.Error("fetch failure was ignored")
+	}
+	f.mode(nativeFetch, 0)
+	f.mode(nativeMore, 2)
+	if err := cursor.Advance(); err == nil {
+		t.Error("result-advance failure was ignored")
+	}
+	f.mode(nativeMore, 0)
+	f.cols(-1)
+	if err := f.stmt.BindColumns(f.conn); err == nil {
+		t.Error("negative column count accepted")
+	}
+}
+
+func TestAuditZeroColumnResults(t *testing.T) {
+	for _, leading := range []bool{true, false} {
+		t.Run(map[bool]string{true: "leading update count", false: "intermediate update count"}[leading], func(t *testing.T) {
+			f := auditNative(t)
+			if leading {
+				f.set(11, 1)
+				var columns func(int32)
+				h, err := purego.Dlopen(os.Getenv("FLOWER_ODBC_TEST_LIBRARY"), purego.RTLD_NOW|purego.RTLD_LOCAL)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer purego.Dlclose(h)
+				purego.RegisterLibFunc(&columns, h, "TestODBCColumns")
+				columns(0)
+			} else {
+				f.set(11, 2)
+			}
+			rows, err := f.conn.QueryContext(context.Background(), "owned batch with an update count and a rowset", nil)
+			if err != nil {
+				t.Fatalf("row-producing batch failed before its rows: %v", err)
+			}
+			defer rows.Close()
+			seen := 0
+			for {
+				if len(rows.Columns()) != 0 {
+					values := make([]driver.Value, len(rows.Columns()))
+					if err := rows.Next(values); err != nil || values[0] != int32(42) {
+						t.Fatalf("rowset value=%v error=%v", values, err)
+					}
+					seen++
+				}
+				err := rows.(driver.RowsNextResultSet).NextResultSet()
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					t.Fatalf("update count interrupted result traversal: %v", err)
+				}
+			}
+			want := 2
+			if leading {
+				want = 1
+			}
+			if seen != want {
+				t.Errorf("rowsets=%d; want %d", seen, want)
+			}
+		})
+	}
+	t.Run("final update count", func(t *testing.T) {
+		f := auditNative(t)
+		f.cols(0)
+		if err := f.stmt.BindColumns(f.conn); !errors.Is(err, io.EOF) {
+			t.Fatalf("final update count = %v; want EOF", err)
+		}
+	})
+	t.Run("failed update advance", func(t *testing.T) {
+		f := auditNative(t)
+		f.cols(0)
+		f.mode(nativeMore, 2)
+		if err := f.stmt.BindColumns(f.conn); err == nil {
+			t.Fatal("failed update-count advance succeeded")
+		}
+	})
+}
+
+func TestAuditCanceledColumnAdvance(t *testing.T) {
+	if auditWrapSQL == nil {
+		t.Skip("test-only native injection overlay not selected")
+	}
+	for _, cancelAt := range []string{"SQLNumResultCols", "SQLMoreResults"} {
+		t.Run(cancelAt, func(t *testing.T) {
+			f := auditNative(t)
+			f.cols(0)
+			f.set(11, 1)
+			afterCancel := 0
+			for _, name := range []string{"SQLNumResultCols", "SQLMoreResults"} {
+				restore, err := auditWrapSQL(name, func() {
+					if !f.conn.IsValid() {
+						afterCancel++
+					}
+					if name == cancelAt {
+						f.conn.invalidate()
+					}
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer restore()
+			}
+			if err := f.stmt.BindColumns(f.conn); !errors.Is(err, errNativeInvalid) {
+				t.Errorf("canceled result traversal returned %v", err)
+			}
+			if afterCancel != 0 {
+				t.Errorf("started %d native calls after cancellation", afterCancel)
 			}
 		})
 	}

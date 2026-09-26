@@ -9,6 +9,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 	"time"
@@ -295,20 +296,46 @@ func (s *ODBCStmt) BindColumns(conn *Conn) error {
 	if !conn.IsValid() {
 		return driver.ErrBadConn
 	}
-	// count columns
 	var n api.SQLSMALLINT
-	ret, callErr := safeSQLCall("SQLNumResultCols", func() api.SQLRETURN {
-		return api.SQLNumResultCols(s.h, &n)
-	})
-	if callErr != nil {
-		conn.invalidate()
-		return callErr
-	}
-	if IsError(ret) {
-		return conn.newError("SQLNumResultCols", s.h)
-	}
-	if n < 1 {
-		return errors.New("Stmt did not create a result set")
+	for {
+		ret, callErr := safeSQLCall("SQLNumResultCols", func() api.SQLRETURN {
+			return api.SQLNumResultCols(s.h, &n)
+		})
+		if callErr != nil {
+			conn.invalidate()
+			return callErr
+		}
+		if !conn.IsValid() {
+			return errNativeInvalid
+		}
+		if IsError(ret) {
+			return conn.newError("SQLNumResultCols", s.h)
+		}
+		if n < 0 {
+			return fmt.Errorf("invalid negative result column count %d", n)
+		}
+		if n > 0 {
+			break
+		}
+
+		// Batches may report update counts between row-producing results.
+		ret, callErr = safeSQLCall("SQLMoreResults", func() api.SQLRETURN {
+			return api.SQLMoreResults(s.h)
+		})
+		if callErr != nil {
+			conn.invalidate()
+			return callErr
+		}
+		if !conn.IsValid() {
+			return errNativeInvalid
+		}
+		if ret == api.SQL_NO_DATA {
+			s.markNoMoreResults()
+			return io.EOF
+		}
+		if IsError(ret) {
+			return conn.newError("SQLMoreResults", s.h)
+		}
 	}
 	// fetch column descriptions
 	if len(s.Cols) > 0 {

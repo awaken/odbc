@@ -39,6 +39,13 @@ func TestDriverStatsSnapshot(t *testing.T) {
 	}
 }
 
+func TestAuditInvalidHandleStats(t *testing.T) {
+	var s handleStats
+	if err := s.updateHandleCount(-1, 1); err == nil || s.snapshot() != (Stats{}) {
+		t.Fatalf("invalid handle changed statistics: error=%v counts=%+v", err, s.snapshot())
+	}
+}
+
 func TestDriverStatsSnapshotConcurrent(t *testing.T) {
 	driver := new(Driver)
 	var waitGroup sync.WaitGroup

@@ -12,6 +12,8 @@ import (
 	"io"
 	"os"
 	"testing"
+
+	"github.com/alexbrainman/odbc/api"
 )
 
 func TestRowsCloseAfterFinalResultSet(t *testing.T) {
@@ -24,6 +26,55 @@ func TestRowsCloseAfterFinalResultSet(t *testing.T) {
 	}
 	if s.isUsedByRows() {
 		t.Fatal("rows still own the statement after close")
+	}
+}
+
+func TestAuditRowsNativeFailure(t *testing.T) {
+	for _, stage := range []string{"value", "cursor close"} {
+		t.Run(stage, func(t *testing.T) {
+			f := auditNative(t)
+			s := &Stmt{c: f.conn, os: f.stmt}
+			if stage == "value" {
+				f.set(0, int64(api.SQL_VARCHAR))
+				f.set(1, 8)
+			}
+			r, err := s.Query(nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if stage == "value" {
+				f.set(12, 5)
+				values := []driver.Value{"unchanged"}
+				err = r.Next(values)
+				if values[0] != "unchanged" {
+					t.Errorf("failed fetch published values: %v", values)
+				}
+			} else {
+				f.mode(nativeCursor, 2)
+				defer f.mode(nativeCursor, 0)
+				err = r.Close()
+			}
+			if err == nil || f.conn.IsValid() || r.(*Rows).HasNextResultSet() {
+				t.Fatalf("failed rows reused connection: error=%v valid=%v", err, f.conn.IsValid())
+			}
+			auditWaitClose(t, f.conn)
+		})
+	}
+}
+
+func TestAuditRowsInvalidConnection(t *testing.T) {
+	r := &odbcRows{c: new(Conn), os: new(ODBCStmt)}
+	if err := r.Next(nil); !errors.Is(err, errNativeInvalid) {
+		t.Fatal(err)
+	}
+	if err := r.Advance(); !errors.Is(err, errNativeInvalid) {
+		t.Fatal(err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.os.releaseHandle(); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -155,8 +206,8 @@ func (rowsTestDriver) Open(string) (driver.Conn, error) { return nil, errors.New
 type rowsTestConn struct{ cursor *rowsTestCursor }
 
 func (rowsTestConn) Prepare(string) (driver.Stmt, error) { return nil, errors.New("unused") }
-func (rowsTestConn) Close() error { return nil }
-func (rowsTestConn) Begin() (driver.Tx, error) { return nil, errors.New("unused") }
+func (rowsTestConn) Close() error                        { return nil }
+func (rowsTestConn) Begin() (driver.Tx, error)           { return nil, errors.New("unused") }
 func (c rowsTestConn) QueryContext(context.Context, string, []driver.NamedValue) (driver.Rows, error) {
 	return &Rows{rowsCursor: c.cursor}, nil
 }

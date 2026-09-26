@@ -9,6 +9,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"math"
+	"strings"
 	"testing"
 
 	"github.com/alexbrainman/odbc/api"
@@ -108,5 +109,78 @@ func TestStmtStopsResultsAfterInvalidation(t *testing.T) {
 	})
 	if err == nil || counts != 1 {
 		t.Fatalf("invalidated result traversal continued: count=%d err=%v", counts, err)
+	}
+}
+
+func TestAuditResultCallPanics(t *testing.T) {
+	for _, stage := range []string{"count", "advance"} {
+		t.Run(stage, func(t *testing.T) {
+			s := &Stmt{c: &Conn{h: 1}}
+			result, err := s.execResults(new(ODBCStmt), func(_ api.SQLHSTMT, n *api.SQLLEN) api.SQLRETURN {
+				if stage == "count" {
+					panic("owned count failure")
+				}
+				*n = 1
+				return api.SQL_SUCCESS
+			}, func(api.SQLHSTMT) api.SQLRETURN { panic("owned advance failure") })
+			if result != nil || err == nil || !strings.Contains(err.Error(), "panicked while calling the native ODBC driver manager") || s.c.IsValid() {
+				t.Fatalf("native call panic escaped: result=%v error=%v valid=%v", result, err, s.c.IsValid())
+			}
+		})
+	}
+}
+
+func TestAuditStatementContextReuse(t *testing.T) {
+	for _, query := range []bool{false, true} {
+		for _, fail := range []bool{false, true} {
+			name := "execute"
+			if query {
+				name = "query"
+			}
+			if fail {
+				name += " prepare failure"
+			}
+			t.Run(name, func(t *testing.T) {
+				f := auditNative(t)
+				s := &Stmt{c: f.conn, os: f.stmt, query: "fixture"}
+				defer s.Close()
+				r, err := s.QueryContext(context.Background(), nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer r.Close()
+				if fail {
+					f.mode(nativePrepare, 2)
+					defer f.mode(nativePrepare, 0)
+				}
+				if query {
+					var next driver.Rows
+					next, err = s.QueryContext(context.Background(), nil)
+					if next != nil {
+						defer next.Close()
+					}
+				} else {
+					_, err = s.ExecContext(context.Background(), nil)
+				}
+				if (err != nil) != fail {
+					t.Fatalf("statement reuse error=%v; want failure=%v", err, fail)
+				}
+				values := make([]driver.Value, 1)
+				if err := r.Next(values); err != nil || values[0] != int32(42) {
+					t.Fatalf("existing result was lost: values=%v error=%v", values, err)
+				}
+			})
+		}
+	}
+}
+
+func TestAuditStatementNativeRowCount(t *testing.T) {
+	f := auditNative(t)
+	f.set(20, int64(api.SQL_ERROR))
+	s := &Stmt{c: f.conn, os: f.stmt}
+	result, err := s.ExecContext(context.Background(), nil)
+	var diagnostic *Error
+	if result != nil || !errors.As(err, &diagnostic) || diagnostic.APIName != "SQLRowCount" {
+		t.Fatalf("row count error discarded: result=%v error=%v", result, err)
 	}
 }

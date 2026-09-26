@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/alexbrainman/odbc/api"
 )
 
 func TestQueryContextStopsBeforeNativeCall(t *testing.T) {
@@ -36,6 +38,114 @@ func TestQueryContextStopsBeforeNativeCall(t *testing.T) {
 	}
 	if _, err := connection.QueryContext(context.Background(), "select 1", nil); !errors.Is(err, driver.ErrBadConn) {
 		t.Fatalf("QueryContext bad connection error = %v; want %v", err, driver.ErrBadConn)
+	}
+}
+
+func TestAuditNamedArgumentsRejected(t *testing.T) {
+	c := new(Conn)
+	s := &Stmt{c: c}
+	args := []driver.NamedValue{{Name: "named", Value: 1}}
+	for _, tc := range []struct {
+		name string
+		run  func() error
+	}{
+		{"connection execute", func() error { _, err := c.ExecContext(context.Background(), "fixture", args); return err }},
+		{"connection query", func() error { _, err := c.QueryContext(context.Background(), "fixture", args); return err }},
+		{"statement execute", func() error { _, err := s.ExecContext(context.Background(), args); return err }},
+		{"statement query", func() error { _, err := s.QueryContext(context.Background(), args); return err }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.run(); err == nil || !strings.Contains(err.Error(), "Named Parameters") {
+				t.Fatalf("named argument reached native admission: %v", err)
+			}
+		})
+	}
+}
+
+func TestAuditConnectionLossDiagnostic(t *testing.T) {
+	f := auditNative(t)
+	f.set(16, 4)
+	f.mode(nativeExecute, 2)
+	defer f.mode(nativeExecute, 0)
+	_, err := f.conn.ExecContext(context.Background(), "fixture", nil)
+	var diagnostic *Error
+	if !errors.As(err, &diagnostic) || len(diagnostic.Diag) != 1 || diagnostic.Diag[0].State != "08S01" || f.conn.IsValid() {
+		t.Fatalf("connection loss diagnostic: error=%v valid=%v", err, f.conn.IsValid())
+	}
+	if errors.Is(err, driver.ErrBadConn) {
+		t.Fatal("started failed work may be replayed by database/sql")
+	}
+	auditWaitClose(t, f.conn)
+}
+
+func TestAuditInternalAdmissionGuards(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	c := new(Conn)
+	s := &Stmt{c: c, os: new(ODBCStmt)}
+	for _, tc := range []struct {
+		name string
+		run  func(context.Context) error
+	}{
+		{"prepare", func(ctx context.Context) error { _, err := c.prepareContext(ctx, "fixture"); return err }},
+		{"execute", func(ctx context.Context) error { _, err := c.execContext(ctx, "fixture", nil); return err }},
+		{"query", func(ctx context.Context) error { _, err := c.queryContext(ctx, "fixture", nil); return err }},
+		{"statement execute", func(ctx context.Context) error { _, err := s.execContext(ctx, nil); return err }},
+		{"statement query", func(ctx context.Context) error { _, err := s.queryContext(ctx, nil); return err }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.run(ctx); !errors.Is(err, context.Canceled) {
+				t.Fatalf("canceled work: %v", err)
+			}
+			if err := tc.run(context.Background()); !errors.Is(err, driver.ErrBadConn) {
+				t.Fatalf("invalid connection: %v", err)
+			}
+		})
+	}
+	if _, err := c.prepare("fixture"); !errors.Is(err, driver.ErrBadConn) {
+		t.Fatal(err)
+	}
+	if _, err := c.prepareODBCStmtContext(ctx, "fixture"); !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	if err := c.prepareAllocatedODBCStmt(new(ODBCStmt), api.StringToUTF16("fixture")); !errors.Is(err, errNativeInvalid) {
+		t.Fatal(err)
+	}
+}
+
+func TestAuditContextPositionalBinding(t *testing.T) {
+	f := auditNative(t)
+	f.set(2, 1)
+	args := []driver.NamedValue{{Ordinal: 1, Value: "owned"}}
+	result, err := f.conn.ExecContext(context.Background(), "fixture", args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count, err := result.RowsAffected(); err != nil || count != 1 {
+		t.Fatalf("affected rows: count=%d error=%v", count, err)
+	}
+	if f.get(5) != 10 || f.get(8) != int64(api.SQL_C_WCHAR) {
+		t.Fatalf("positional text binding: length=%d type=%d", f.get(5), f.get(8))
+	}
+	r, err := f.conn.QueryContext(context.Background(), "fixture", args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	values := make([]driver.Value, 1)
+	if err := r.Next(values); err != nil || values[0] != int32(42) {
+		t.Errorf("positional query: values=%v error=%v", values, err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if result, err := f.conn.ExecContext(context.Background(), "fixture", nil); result != nil || err == nil {
+		t.Fatalf("missing execution argument: result=%v error=%v", result, err)
+	}
+	if rows, err := f.conn.QueryContext(context.Background(), "fixture", nil); rows != nil || err == nil {
+		t.Fatalf("missing query argument: rows=%v error=%v", rows, err)
+	}
+	if f.conn.driver.Stats().StmtCount != 1 || !f.conn.IsValid() {
+		t.Fatalf("positional execution leaked resources: %+v", f.conn.driver.Stats())
 	}
 }
 

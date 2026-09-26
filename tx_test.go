@@ -10,6 +10,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"github.com/alexbrainman/odbc/api"
 )
 
 func TestBeginFailureDoesNotLeaveActiveTransaction(t *testing.T) {
@@ -31,6 +33,91 @@ func TestBeginFailureDoesNotLeaveActiveTransaction(t *testing.T) {
 	if !connection.bad.Load() {
 		t.Fatal("Begin did not mark the connection bad")
 	}
+}
+
+func TestAuditTransactions(t *testing.T) {
+	for _, commit := range []bool{true, false} {
+		name := "rollback"
+		if commit {
+			name = "commit"
+		}
+		t.Run(name, func(t *testing.T) {
+			f := auditNative(t)
+			tx, err := f.conn.BeginTx(context.Background(), driver.TxOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if again, err := f.conn.Begin(); err == nil || again != nil {
+				t.Fatalf("nested transaction accepted: %v, %v", again, err)
+			}
+			want := int64(api.SQL_ROLLBACK)
+			if commit {
+				err = tx.Commit()
+				want = int64(api.SQL_COMMIT)
+			} else {
+				err = tx.Rollback()
+			}
+			if err != nil || f.conn.tx != nil || !f.conn.IsValid() || f.get(21) != want {
+				t.Fatalf("transaction completion: error=%v active=%v valid=%v action=%d", err, f.conn.tx != nil, f.conn.IsValid(), f.get(21))
+			}
+			if err := tx.Commit(); err == nil || !strings.Contains(err.Error(), "not in a transaction") {
+				t.Fatalf("repeated completion: %v", err)
+			}
+		})
+	}
+	if _, err := new(Conn).begin(); !errors.Is(err, driver.ErrBadConn) {
+		t.Fatalf("begin on invalid connection: %v", err)
+	}
+	if err := (&Tx{c: new(Conn)}).Rollback(); !errors.Is(err, errNativeInvalid) {
+		t.Fatalf("rollback on invalid connection: %v", err)
+	}
+}
+
+func TestAuditTransactionNativeFailures(t *testing.T) {
+	for _, stage := range []string{"begin", "end", "restore autocommit"} {
+		t.Run(stage, func(t *testing.T) {
+			f := auditNative(t)
+			defer f.mode(nativeAutocommit, 0)
+			var err error
+			wantAPI := "SQLSetConnectUIntPtrAttr"
+			if stage == "begin" {
+				f.mode(nativeAutocommit, 2)
+				_, err = f.conn.Begin()
+			} else {
+				tx, beginErr := f.conn.Begin()
+				if beginErr != nil {
+					t.Fatal(beginErr)
+				}
+				if stage == "end" {
+					f.set(17, 1)
+					wantAPI = "SQLEndTran"
+				} else {
+					f.mode(nativeAutocommit, 2)
+				}
+				err = tx.Commit()
+			}
+			var diagnostic *Error
+			if !errors.As(err, &diagnostic) || diagnostic.APIName != wantAPI || f.conn.IsValid() {
+				t.Fatalf("native failure: error=%v valid=%v", err, f.conn.IsValid())
+			}
+			auditWaitClose(t, f.conn)
+		})
+	}
+}
+
+func TestAuditTransactionCleanupDeadline(t *testing.T) {
+	f := auditNative(t)
+	tx, err := f.conn.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.mode(nativeEndTran, 1)
+	defer f.mode(nativeEndTran, 0)
+	if err := tx.Commit(); !errors.Is(err, ErrCleanupPending) || f.conn.IsValid() {
+		t.Fatalf("blocked commit: error=%v valid=%v", err, f.conn.IsValid())
+	}
+	f.mode(nativeEndTran, 0)
+	auditWaitClose(t, f.conn)
 }
 
 func TestBeginTxValidatesContextAndOptionsBeforeNativeCall(t *testing.T) {

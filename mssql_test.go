@@ -268,7 +268,10 @@ func exec(t *testing.T, db *sql.DB, query string) {
 func driverExec(t *testing.T, dc driver.Conn, query string) {
 	st, err := dc.(driver.ConnPrepareContext).PrepareContext(context.Background(), query)
 	if err != nil {
-		t.Fatal(err)
+		if t != nil {
+			t.Fatal(err)
+		}
+		return
 	}
 	defer func() {
 		if err := st.Close(); err != nil && t != nil {
@@ -2495,4 +2498,27 @@ func TestCloseDBLeakDiagnostic(t *testing.T) {
 	if !strings.Contains(string(out), "unexpected StmtCount: should=7, is=0") {
 		t.Fatalf("incorrect expected handle count: %s", out)
 	}
+}
+
+// A local failed prepare exercises optional cleanup without a database.
+type auditFailedPrepare struct{}
+
+func (auditFailedPrepare) Prepare(string) (driver.Stmt, error) {
+	return nil, errors.New("synthetic prepare failure")
+}
+func (auditFailedPrepare) PrepareContext(context.Context, string) (driver.Stmt, error) {
+	return nil, errors.New("synthetic prepare failure")
+}
+func (auditFailedPrepare) Close() error { return nil }
+func (auditFailedPrepare) Begin() (driver.Tx, error) {
+	return nil, errors.New("unused")
+}
+
+func TestAuditOptionalDriverExec(t *testing.T) {
+	defer func() {
+		if p := recover(); p != nil {
+			t.Errorf("optional table cleanup panicked on prepare failure: %v", p)
+		}
+	}()
+	driverExec(nil, auditFailedPrepare{}, "owned synthetic cleanup")
 }

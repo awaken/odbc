@@ -141,8 +141,7 @@ func (p *Parameter) BindValue(h api.SQLHSTMT, idx int, v driver.Value, conn *Con
 		sqltype = api.SQL_TYPE_TIMESTAMP
 		if p.isDescribed && p.SQLType == api.SQL_TYPE_TIMESTAMP {
 			decimal = p.Decimal
-		}
-		if decimal <= 0 {
+		} else {
 			// represented as yyyy-mm-dd hh:mm:ss.fff format in ms sql server
 			decimal = 3
 		}
@@ -159,6 +158,9 @@ func (p *Parameter) BindValue(h api.SQLHSTMT, idx int, v driver.Value, conn *Con
 		}
 		buflen = api.SQLLEN(len(b))
 		indicatorValue = buflen
+		if d == nil {
+			indicatorValue = api.SQL_NULL_DATA
+		}
 		hasIndicator = true
 		size = api.SQLULEN(len(b))
 		switch {
@@ -276,7 +278,10 @@ func readParameters(h api.SQLHSTMT, valid func() bool) ([]Parameter, error) {
 }
 
 func extractParameters(n int, describe func(int, *Parameter) (api.SQLRETURN, error), diagnostic func() error) ([]Parameter, error) {
-	if n <= 0 {
+	if n < 0 {
+		return nil, fmt.Errorf("invalid negative parameter count %d", n)
+	}
+	if n == 0 {
 		// no parameters
 		return nil, nil
 	}

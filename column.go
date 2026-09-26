@@ -139,9 +139,11 @@ func newColumn(h api.SQLHSTMT, idx int, describe columnDescriber) (Column, error
 		var v api.SQLGUID
 		return NewBindableColumn(b, api.SQL_C_GUID, int(unsafe.Sizeof(v))), nil
 	case api.SQL_CHAR, api.SQL_VARCHAR:
-		return NewVariableWidthColumn(b, api.SQL_C_CHAR, size)
+		// ColumnSize counts characters, not encoded bytes. Stream text so a
+		// multibyte conversion cannot outgrow a fixed byte buffer.
+		return NewVariableWidthColumn(b, api.SQL_C_CHAR, 0)
 	case api.SQL_WCHAR, api.SQL_WVARCHAR:
-		return NewVariableWidthColumn(b, api.SQL_C_WCHAR, size)
+		return NewVariableWidthColumn(b, api.SQL_C_WCHAR, 0)
 	case api.SQL_BINARY, api.SQL_VARBINARY:
 		return NewVariableWidthColumn(b, api.SQL_C_BINARY, size)
 	case api.SQL_LONGVARCHAR:

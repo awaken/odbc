@@ -18,6 +18,12 @@ import (
 )
 
 type nativeFunctions struct {
+	SQLGetInfo     func(SQLHDBC, SQLUSMALLINT, SQLPOINTER, SQLSMALLINT, *SQLSMALLINT) SQLRETURN
+	SQLTables      func(SQLHSTMT, *SQLWCHAR, SQLSMALLINT, *SQLWCHAR, SQLSMALLINT, *SQLWCHAR, SQLSMALLINT, *SQLWCHAR, SQLSMALLINT) SQLRETURN
+	SQLColumns     func(SQLHSTMT, *SQLWCHAR, SQLSMALLINT, *SQLWCHAR, SQLSMALLINT, *SQLWCHAR, SQLSMALLINT, *SQLWCHAR, SQLSMALLINT) SQLRETURN
+	SQLPrimaryKeys func(SQLHSTMT, *SQLWCHAR, SQLSMALLINT, *SQLWCHAR, SQLSMALLINT, *SQLWCHAR, SQLSMALLINT) SQLRETURN
+	SQLStatistics  func(SQLHSTMT, *SQLWCHAR, SQLSMALLINT, *SQLWCHAR, SQLSMALLINT, *SQLWCHAR, SQLSMALLINT, SQLUSMALLINT, SQLUSMALLINT) SQLRETURN
+
 	SQLAllocHandle    func(SQLSMALLINT, SQLHANDLE, *SQLHANDLE) SQLRETURN
 	SQLBindCol        func(SQLHSTMT, SQLUSMALLINT, SQLSMALLINT, SQLPOINTER, SQLLEN, *SQLLEN) SQLRETURN
 	SQLBindParameter  func(SQLHSTMT, SQLUSMALLINT, SQLSMALLINT, SQLSMALLINT, SQLSMALLINT, SQLULEN, SQLSMALLINT, SQLPOINTER, SQLLEN, *SQLLEN) SQLRETURN
@@ -169,6 +175,12 @@ func bindNativeFunctions(handle uintptr, functions *nativeFunctions, bind bindFu
 			return fmt.Errorf("resolve %s: %w", function.name, err)
 		}
 	}
+	// Catalog exports are optional: basic SQL remains usable with older managers.
+	_ = bind(handle, "SQLGetInfoW", &functions.SQLGetInfo)
+	_ = bind(handle, "SQLTablesW", &functions.SQLTables)
+	_ = bind(handle, "SQLColumnsW", &functions.SQLColumns)
+	_ = bind(handle, "SQLPrimaryKeysW", &functions.SQLPrimaryKeys)
+	_ = bind(handle, "SQLStatisticsW", &functions.SQLStatistics)
 	return nil
 }
 
