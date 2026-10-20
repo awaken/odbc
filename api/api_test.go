@@ -20,7 +20,7 @@ func TestAuditUTF16Pointer(t *testing.T) {
 		if p == nil {
 			t.Fatalf("nil UTF-16 pointer for %q", tc.text)
 		}
-		if got := unsafe.Slice(p, len(tc.want)); !reflect.DeepEqual(got, tc.want) {
+		if got := unsafe.Slice(p, len(tc.want)); !reflect.DeepEqual(got, tc.want) { // #nosec G103 -- The test views its own typed buffer with its exact allocated size.
 			t.Errorf("UTF-16 for %q: %x; want %x", tc.text, got, tc.want)
 		}
 	}

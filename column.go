@@ -41,7 +41,7 @@ func columnBufferPointer(buffer []byte) api.SQLPOINTER {
 	if len(buffer) == 0 {
 		return nil
 	}
-	return api.SQLPOINTER(unsafe.Pointer(&buffer[0]))
+	return api.SQLPOINTER(unsafe.Pointer(&buffer[0])) // #nosec G103 -- The ODBC ABI requires typed pointers into owned buffers retained for the native call.
 }
 
 // Column provides access to row columns.
@@ -55,7 +55,7 @@ func describeColumn(h api.SQLHSTMT, idx int, namebuf []uint16) (namelen int, sql
 	var l, decimal, nullable api.SQLSMALLINT
 	ret, err = safeSQLCall("SQLDescribeCol", func() api.SQLRETURN {
 		return api.SQLDescribeCol(h, api.SQLUSMALLINT(idx+1),
-			(*api.SQLWCHAR)(unsafe.Pointer(&namebuf[0])),
+			(*api.SQLWCHAR)(unsafe.Pointer(&namebuf[0])), // #nosec G103 -- The ODBC ABI requires typed pointers into owned buffers retained for the native call.
 			api.SQLSMALLINT(len(namebuf)), &l,
 			&sqltype, &size, &decimal, &nullable)
 	})
@@ -209,7 +209,7 @@ func (c *BaseColumn) Value(buf []byte) (driver.Value, error) {
 	}
 	var p unsafe.Pointer
 	if len(buf) > 0 {
-		p = unsafe.Pointer(&buf[0])
+		p = unsafe.Pointer(&buf[0]) // #nosec G103 -- Decode the native ODBC value only after validating its buffer length.
 	}
 	switch c.CType {
 	case api.SQL_C_BIT:
@@ -226,7 +226,7 @@ func (c *BaseColumn) Value(buf []byte) (driver.Value, error) {
 		if p == nil {
 			return buf, nil
 		}
-		s := unsafe.Slice((*uint16)(p), len(buf)/2)
+		s := unsafe.Slice((*uint16)(p), len(buf)/2) // #nosec G103 -- The UTF-16 view stays within the buffer's validated even byte length.
 		return utf16toutf8(s), nil
 	case api.SQL_C_TYPE_TIMESTAMP:
 		t := (*api.SQL_TIMESTAMP_STRUCT)(p)

@@ -26,7 +26,11 @@ func TestFoxPro(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
 	if err := db.Ping(); err != nil {
 		t.Skipf("skipping test: %v", err)
 	}

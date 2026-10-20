@@ -120,7 +120,7 @@ func (c *Conn) allocateODBCStmt(query string) (*ODBCStmt, []uint16, error) {
 	h := api.SQLHSTMT(out)
 	err := c.stats.updateHandleCount(api.SQL_HANDLE_STMT, 1)
 	if err != nil {
-		defer releaseHandle(h, c.stats)
+		defer func() { _ = releaseHandle(h, c.stats) }()
 		return nil, nil, err
 	}
 	s := &ODBCStmt{h: h, stats: c.stats, usedByStmt: true, conn: c}
@@ -136,7 +136,7 @@ func (c *Conn) prepareAllocatedODBCStmt(s *ODBCStmt, queryText []uint16) error {
 		return errNativeInvalid
 	}
 	ret, callErr := safeSQLCall("SQLPrepare", func() api.SQLRETURN {
-		return api.SQLPrepare(s.h, (*api.SQLWCHAR)(unsafe.Pointer(&queryText[0])), api.SQL_NTS)
+		return api.SQLPrepare(s.h, (*api.SQLWCHAR)(unsafe.Pointer(&queryText[0])), api.SQL_NTS) // #nosec G103 -- The ODBC ABI requires typed pointers into owned buffers retained for the native call.
 	})
 	if callErr != nil {
 		c.invalidate()

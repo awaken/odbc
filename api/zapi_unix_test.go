@@ -48,7 +48,7 @@ func TestAuditUnavailableDriverManager(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		if err := os.RemoveAll(dir); err != nil {
+		if err := os.RemoveAll(dir); err != nil { // #nosec G703 -- The path belongs to this test's owned fixture or private temporary directory.
 			t.Error(err)
 		}
 	})
@@ -170,7 +170,11 @@ func TestAuditNativeLoaderFailures(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer purego.Dlclose(h)
+	defer func() {
+		if err := purego.Dlclose(h); err != nil {
+			t.Error(err)
+		}
+	}()
 	var call func(SQLHSTMT) SQLRETURN
 	if err := bindFunction(h, "AuditAbsentSymbol", &call); err == nil || call != nil {
 		t.Fatalf("missing function accepted: %v", err)

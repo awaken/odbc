@@ -60,7 +60,7 @@ func (c *Conn) Info(ctx context.Context) (DBMSInfo, error) {
 func (c *Conn) infoString(key api.SQLUSMALLINT) (string, error) {
 	return readInfoString(func(buf []uint16, n *api.SQLSMALLINT) error {
 		ret, err := safeSQLCall("SQLGetInfo", func() api.SQLRETURN {
-			return api.SQLGetInfo(c.h, key, api.SQLPOINTER(unsafe.Pointer(&buf[0])), api.SQLSMALLINT(len(buf)*2), n)
+			return api.SQLGetInfo(c.h, key, api.SQLPOINTER(unsafe.Pointer(&buf[0])), api.SQLSMALLINT(len(buf)*2), n) // #nosec G103 -- The ODBC ABI requires typed pointers into owned buffers retained for the native call.
 		})
 		if err != nil {
 			c.invalidate()
@@ -163,7 +163,7 @@ func (c *Conn) Catalog(ctx context.Context, kind CatalogKind, filter CatalogFilt
 				if len(v) == 0 {
 					return nil
 				}
-				return (*api.SQLWCHAR)(unsafe.Pointer(&v[0]))
+				return (*api.SQLWCHAR)(unsafe.Pointer(&v[0])) // #nosec G103 -- The ODBC ABI requires typed pointers into owned buffers retained for the native call.
 			}
 			ret, callErr := safeSQLCall("ODBC catalog", func() api.SQLRETURN {
 				switch kind {

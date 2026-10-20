@@ -62,7 +62,7 @@ func validateODBCAttributes(dsn string) error {
 			for i < len(rest) {
 				if rest[i] == '}' {
 					if i+1 < len(rest) && rest[i+1] == '}' {
-						b.WriteByte('}')
+						_ = b.WriteByte('}')
 						i += 2
 						continue
 					}
@@ -70,7 +70,7 @@ func validateODBCAttributes(dsn string) error {
 					closed = true
 					break
 				}
-				b.WriteByte(rest[i])
+				_ = b.WriteByte(rest[i])
 				i++
 			}
 			if !closed {
@@ -162,7 +162,7 @@ func (c *Conn) openNative(dsn string) error {
 		return NewError("SQLAllocHandle", d.h)
 	}
 	c.h = api.SQLHDBC(out)
-	d.stats.updateHandleCount(api.SQL_HANDLE_DBC, 1)
+	_ = d.stats.updateHandleCount(api.SQL_HANDLE_DBC, 1)
 	if c.bad.Load() {
 		return errNativeInvalid
 	}
@@ -170,7 +170,7 @@ func (c *Conn) openNative(dsn string) error {
 	b := api.StringToUTF16(dsn)
 	ret, callErr = safeSQLCall("SQLDriverConnect", func() api.SQLRETURN {
 		return api.SQLDriverConnect(c.h, 0,
-			(*api.SQLWCHAR)(unsafe.Pointer(&b[0])), api.SQL_NTS,
+			(*api.SQLWCHAR)(unsafe.Pointer(&b[0])), api.SQL_NTS, // #nosec G103 -- The ODBC ABI requires typed pointers into owned buffers retained for the native call.
 			nil, 0, nil, api.SQL_DRIVER_NOPROMPT)
 	})
 	if callErr != nil {

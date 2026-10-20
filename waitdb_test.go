@@ -72,17 +72,17 @@ exec)
 *) printf 'unexpected mock command\n' >&2; exit 2 ;;
 esac
 `
-	if err := os.WriteFile(filepath.Join(root, "docker"), []byte(mock), 0o700); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "docker"), []byte(mock), 0o700); err != nil { // #nosec G306 -- The private test fixture must be executable.
 		t.Fatal(err)
 	}
 	// Leave setup time before Bash's whole-second readiness deadline.
-	cmd := osexec.Command("timeout", "--kill-after=1s", "5s", "make", "--no-print-directory", "-f", makefile,
+	cmd := osexec.Command("timeout", "--kill-after=1s", "5s", "make", "--no-print-directory", "-f", makefile, // #nosec G204 -- The test invokes fixed build tools with owned fixture paths and arguments.
 		"start-"+backend, "ODBC_READY_TIMEOUT=2", "ODBC_COMMAND_TIMEOUT=1", "PASSWORD=synthetic")
 	cmd.Dir = root
 	cmd.Env = append(os.Environ(), "PATH="+root+string(os.PathListSeparator)+os.Getenv("PATH"),
 		"ODBC_TEST_MODE="+mode, "ODBC_TEST_BACKEND="+backend, "ODBC_TEST_CALLS="+calls)
 	output, runErr := cmd.CombinedOutput()
-	data, err := os.ReadFile(calls)
+	data, err := os.ReadFile(calls) // #nosec G304 -- The path belongs to this test's owned fixture or private temporary directory.
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +95,7 @@ func TestWaitDBRejectsInvalidOptions(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, option := range []string{"ODBC_READY_TIMEOUT=0", "ODBC_READY_TIMEOUT=invalid", "ODBC_READY_TIMEOUT=3601", "ODBC_COMMAND_TIMEOUT=-1", "DB_NAME=bad name", "DB_NAME="} {
-		cmd := osexec.Command("timeout", "3s", "bash", script, "mssql", "fixture")
+		cmd := osexec.Command("timeout", "3s", "bash", script, "mssql", "fixture") // #nosec G204 -- The test invokes fixed build tools with owned fixture paths and arguments.
 		cmd.Env = append(os.Environ(), "DB_NAME=test", "ODBC_READY_TIMEOUT=1", "ODBC_COMMAND_TIMEOUT=1", option)
 		output, err := cmd.CombinedOutput()
 		if err == nil || !strings.Contains(string(output), "ODBC startup") {

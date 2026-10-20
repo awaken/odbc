@@ -64,7 +64,7 @@ func (p *Parameter) BindValue(h api.SQLHSTMT, idx int, v driver.Value, conn *Con
 		ctype = api.SQL_C_WCHAR
 		b := api.StringToUTF16(d)
 		p.Data = b
-		buf = unsafe.Pointer(&b[0])
+		buf = unsafe.Pointer(&b[0]) // #nosec G103 -- The ODBC ABI requires typed pointers into owned buffers retained for the native call.
 		l := len(b)
 		l -= 1 // remove terminating 0
 		size = api.SQLULEN(l)
@@ -94,13 +94,13 @@ func (p *Parameter) BindValue(h api.SQLHSTMT, idx int, v driver.Value, conn *Con
 			d2 := int32(d)
 			ctype = api.SQL_C_LONG
 			p.Data = &d2
-			buf = unsafe.Pointer(&d2)
+			buf = unsafe.Pointer(&d2) // #nosec G103 -- The ODBC ABI requires typed pointers into owned buffers retained for the native call.
 			sqltype = api.SQL_INTEGER
 			size = 4
 		} else {
 			ctype = api.SQL_C_SBIGINT
 			p.Data = &d
-			buf = unsafe.Pointer(&d)
+			buf = unsafe.Pointer(&d) // #nosec G103 -- The ODBC ABI requires typed pointers into owned buffers retained for the native call.
 			sqltype = api.SQL_BIGINT
 			size = 8
 		}
@@ -111,13 +111,13 @@ func (p *Parameter) BindValue(h api.SQLHSTMT, idx int, v driver.Value, conn *Con
 		}
 		ctype = api.SQL_C_BIT
 		p.Data = &b
-		buf = unsafe.Pointer(&b)
+		buf = unsafe.Pointer(&b) // #nosec G103 -- The ODBC ABI requires typed pointers into owned buffers retained for the native call.
 		sqltype = api.SQL_BIT
 		size = 1
 	case float64:
 		ctype = api.SQL_C_DOUBLE
 		p.Data = &d
-		buf = unsafe.Pointer(&d)
+		buf = unsafe.Pointer(&d) // #nosec G103 -- The ODBC ABI requires typed pointers into owned buffers retained for the native call.
 		sqltype = api.SQL_DOUBLE
 		size = 15
 	case time.Time:
@@ -137,7 +137,7 @@ func (p *Parameter) BindValue(h api.SQLHSTMT, idx int, v driver.Value, conn *Con
 			Fraction: api.SQLUINTEGER(d.Nanosecond()),
 		}
 		p.Data = &b
-		buf = unsafe.Pointer(&b)
+		buf = unsafe.Pointer(&b) // #nosec G103 -- The ODBC ABI requires typed pointers into owned buffers retained for the native call.
 		sqltype = api.SQL_TYPE_TIMESTAMP
 		if p.isDescribed && p.SQLType == api.SQL_TYPE_TIMESTAMP {
 			decimal = p.Decimal
@@ -152,7 +152,7 @@ func (p *Parameter) BindValue(h api.SQLHSTMT, idx int, v driver.Value, conn *Con
 		copy(b, d)
 		p.Data = b
 		if len(d) > 0 {
-			buf = unsafe.Pointer(&b[0])
+			buf = unsafe.Pointer(&b[0]) // #nosec G103 -- The ODBC ABI requires typed pointers into owned buffers retained for the native call.
 		} else {
 			buf = nil
 		}

@@ -63,8 +63,8 @@ func NewError(apiName string, handle interface{}) error {
 	for i := 1; i <= maxDiagnosticRecords; i++ {
 		ret, callErr := safeSQLCall("SQLGetDiagRec", func() api.SQLRETURN {
 			return api.SQLGetDiagRec(ht, h, api.SQLSMALLINT(i),
-				(*api.SQLWCHAR)(unsafe.Pointer(&state[0])), &ne,
-				(*api.SQLWCHAR)(unsafe.Pointer(&msg[0])),
+				(*api.SQLWCHAR)(unsafe.Pointer(&state[0])), &ne, // #nosec G103 -- The ODBC ABI requires typed pointers into owned buffers retained for the native call.
+				(*api.SQLWCHAR)(unsafe.Pointer(&msg[0])), // #nosec G103 -- The ODBC ABI requires typed pointers into owned buffers retained for the native call.
 				api.SQLSMALLINT(len(msg)), &msglen)
 		})
 		if callErr != nil {

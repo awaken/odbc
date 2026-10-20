@@ -57,7 +57,11 @@ func TestUnavailableDriverManagerDoesNotStopProcess(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer database.Close()
+		defer func() {
+			if err := database.Close(); err != nil {
+				t.Error(err)
+			}
+		}()
 		err = database.Ping()
 		if err == nil {
 			t.Fatal("Ping unexpectedly succeeded")
@@ -69,7 +73,7 @@ func TestUnavailableDriverManagerDoesNotStopProcess(t *testing.T) {
 	}
 
 	missingLibrary := filepath.Join(t.TempDir(), "missing-driver-manager")
-	command := osexec.Command(os.Args[0], "-test.run=^TestUnavailableDriverManagerDoesNotStopProcess$")
+	command := osexec.Command(os.Args[0], "-test.run=^TestUnavailableDriverManagerDoesNotStopProcess$") // #nosec G204 G702 -- The child is the current test executable with fixed test selectors.
 	command.Env = append(os.Environ(),
 		helperEnvironment+"=1",
 		api.DriverManagerEnvironment+"="+missingLibrary,

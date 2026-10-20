@@ -157,7 +157,7 @@ func (d *Driver) initDriver() error {
 	d.h = api.SQLHENV(out)
 	err := d.stats.updateHandleCount(api.SQL_HANDLE_ENV, 1)
 	if err != nil {
-		d.Close()
+		_ = d.Close()
 		return err
 	}
 
@@ -166,11 +166,11 @@ func (d *Driver) initDriver() error {
 		return api.SQLSetEnvUIntPtrAttr(d.h, api.SQL_ATTR_ODBC_VERSION, api.SQL_OV_ODBC3, 0)
 	})
 	if callErr != nil {
-		defer d.Close()
+		defer func() { _ = d.Close() }()
 		return callErr
 	}
 	if IsError(ret) {
-		defer d.Close()
+		defer func() { _ = d.Close() }()
 		return NewError("SQLSetEnvUIntPtrAttr(SQL_ATTR_ODBC_VERSION, SQL_OV_ODBC3)", d.h)
 	}
 

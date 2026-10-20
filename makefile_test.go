@@ -31,7 +31,7 @@ func TestMakefileSQLServerRuns(t *testing.T) {
 		t.Fatal(err)
 	}
 	recorder := "#!/bin/sh\nprintf '%s\n' \"$@\" > \"$ODBC_TEST_ARGS\"\n"
-	if err = os.WriteFile(filepath.Join(dir, "docker"), []byte(recorder), 0700); err != nil {
+	if err = os.WriteFile(filepath.Join(dir, "docker"), []byte(recorder), 0700); err != nil { // #nosec G306 -- The private test fixture must be executable.
 		t.Fatal(err)
 	}
 	for _, target := range []string{"test-mssql", "test-mssql-freetds", "test-mssql-race"} {
@@ -40,12 +40,12 @@ func TestMakefileSQLServerRuns(t *testing.T) {
 				log := filepath.Join(dir, "args")
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
-				cmd := osexec.CommandContext(ctx, "make", target)
+				cmd := osexec.CommandContext(ctx, "make", target) // #nosec G204 -- The test invokes fixed build tools with owned fixture paths and arguments.
 				cmd.Env = append(os.Environ(), "PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"), "ODBC_TEST_ARGS="+log, "ODBC_TEST_KEEP="+keep)
 				if out, err := cmd.CombinedOutput(); err != nil {
 					t.Fatalf("make: %v: %s", err, out)
 				}
-				data, err := os.ReadFile(log)
+				data, err := os.ReadFile(log) // #nosec G304 -- The path belongs to this test's owned fixture or private temporary directory.
 				if err != nil {
 					t.Fatal(err)
 				}

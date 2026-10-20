@@ -22,7 +22,7 @@ import (
 )
 
 func bytesOf[T any](value *T) []byte {
-	return unsafe.Slice((*byte)(unsafe.Pointer(value)), int(unsafe.Sizeof(*value)))
+	return unsafe.Slice((*byte)(unsafe.Pointer(value)), int(unsafe.Sizeof(*value))) // #nosec G103 -- The test views its own typed buffer with its exact allocated size.
 }
 
 func TestAuditColumnRetryFailures(t *testing.T) {
@@ -374,7 +374,9 @@ func TestNonBindableColumnPreservesEmptyValue(t *testing.T) {
 			t.Fatal(err)
 		}
 		if _, err := statement.(driver.StmtExecContext).ExecContext(context.Background(), nil); err != nil {
-			statement.Close()
+			if err := statement.Close(); err != nil {
+				t.Error(err)
+			}
 			t.Fatal(err)
 		}
 		if err := statement.Close(); err != nil {
@@ -388,12 +390,20 @@ func TestNonBindableColumnPreservesEmptyValue(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer statement.Close()
+	defer func() {
+		if err := statement.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
 	result, err := statement.(driver.StmtQueryContext).QueryContext(context.Background(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer result.Close()
+	defer func() {
+		if err := result.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
 	rows := result.(*Rows)
 	for i, column := range rows.rowsCursor.(*odbcRows).os.Cols {
 		if _, ok := column.(*NonBindableColumn); !ok {
@@ -425,7 +435,11 @@ func TestAuditMultibyteTextRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rows.Close()
+	defer func() {
+		if err := rows.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
 	values := make([]driver.Value, 1)
 	if err := rows.Next(values); err != nil {
 		t.Fatal(err)

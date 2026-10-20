@@ -88,7 +88,11 @@ func TestRowsPreparedFinalResultSet(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
 	db.SetMaxOpenConns(1)
 	stmtCount := db.Driver().(*Driver).Stats().StmtCount
 
@@ -96,7 +100,11 @@ func TestRowsPreparedFinalResultSet(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer stmt.Close()
+	defer func() {
+		if err := stmt.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
 
 	for i := 0; i < 2; i++ {
 		rows, err := stmt.Query()
@@ -195,7 +203,7 @@ func (c *rowsTestCursor) Close() error { c.closed++; return c.closeErr }
 type rowsTestConnector struct{ cursor *rowsTestCursor }
 
 func (c rowsTestConnector) Connect(context.Context) (driver.Conn, error) {
-	return rowsTestConn{cursor: c.cursor}, nil
+	return rowsTestConn(c), nil
 }
 func (rowsTestConnector) Driver() driver.Driver { return rowsTestDriver{} }
 
@@ -216,12 +224,20 @@ func TestRowsFinalEOFAutomaticallyCloses(t *testing.T) {
 	cursor := &rowsTestCursor{sets: [][][]driver.Value{{{int64(42)}}}, columns: []string{"value"}}
 	db := sql.OpenDB(rowsTestConnector{cursor: cursor})
 	db.SetMaxOpenConns(1)
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
 	rows, err := db.QueryContext(context.Background(), "local fixture")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rows.Close()
+	defer func() {
+		if err := rows.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
 	if !rows.Next() {
 		t.Fatalf("first row: %v", rows.Err())
 	}
@@ -253,12 +269,20 @@ func TestRowsResultSetLookahead(t *testing.T) {
 				columns: []string{"first"},
 			}
 			db := sql.OpenDB(rowsTestConnector{cursor: cursor})
-			defer db.Close()
+			defer func() {
+				if err := db.Close(); err != nil {
+					t.Error(err)
+				}
+			}()
 			rows, err := db.QueryContext(context.Background(), "local fixture")
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer rows.Close()
+			defer func() {
+				if err := rows.Close(); err != nil {
+					t.Error(err)
+				}
+			}()
 			if !rows.Next() {
 				t.Fatal(rows.Err())
 			}
@@ -309,12 +333,20 @@ func TestRowsCursorFailures(t *testing.T) {
 				cursor.closeErr = failure
 			}
 			db := sql.OpenDB(rowsTestConnector{cursor: cursor})
-			defer db.Close()
+			defer func() {
+				if err := db.Close(); err != nil {
+					t.Error(err)
+				}
+			}()
 			rows, err := db.QueryContext(context.Background(), "local fixture")
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer rows.Close()
+			defer func() {
+				if err := rows.Close(); err != nil {
+					t.Error(err)
+				}
+			}()
 			if stage != "fetch" && !rows.Next() {
 				t.Fatal(rows.Err())
 			}

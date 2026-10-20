@@ -143,12 +143,20 @@ func TestAuditStatementContextReuse(t *testing.T) {
 			t.Run(name, func(t *testing.T) {
 				f := auditNative(t)
 				s := &Stmt{c: f.conn, os: f.stmt, query: "fixture"}
-				defer s.Close()
+				defer func() {
+					if err := s.Close(); err != nil {
+						t.Error(err)
+					}
+				}()
 				r, err := s.QueryContext(context.Background(), nil)
 				if err != nil {
 					t.Fatal(err)
 				}
-				defer r.Close()
+				defer func() {
+					if err := r.Close(); err != nil {
+						t.Error(err)
+					}
+				}()
 				if fail {
 					f.mode(nativePrepare, 2)
 					defer f.mode(nativePrepare, 0)
@@ -157,7 +165,11 @@ func TestAuditStatementContextReuse(t *testing.T) {
 					var next driver.Rows
 					next, err = s.QueryContext(context.Background(), nil)
 					if next != nil {
-						defer next.Close()
+						defer func() {
+							if err := next.Close(); err != nil {
+								t.Error(err)
+							}
+						}()
 					}
 				} else {
 					_, err = s.ExecContext(context.Background(), nil)
